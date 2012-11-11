@@ -1,0 +1,11 @@
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -483,7 +483,7 @@
+     FSSchedulerApp schedulerApp =
+         new FSSchedulerApp(applicationAttemptId, user,
+             queue.getQueueSchedulable(), new ActiveUsersManager(this.getRootQueueMetrics()),
+-            rmContext, null);
++            rmContext);
+ 
+     // Inforce ACLs
+     UserGroupInformation userUgi;

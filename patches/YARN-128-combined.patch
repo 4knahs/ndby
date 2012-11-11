@@ -1,0 +1,3349 @@
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestGetGroups.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestGetGroups.java
+index 9f2e554..8effd73 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestGetGroups.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestGetGroups.java
+@@ -28,7 +28,7 @@
+ import org.apache.hadoop.util.Tool;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.service.Service.STATE;
+ import org.junit.AfterClass;
+@@ -46,8 +46,8 @@
+   @BeforeClass
+   public static void setUpResourceManager() throws IOException, InterruptedException {
+     conf = new YarnConfiguration();
+-    Store store = StoreFactory.getStore(conf);
+-    resourceManager = new ResourceManager(store) {
++    RMStateStore store = StoreFactory.getStore(conf);
++    resourceManager = new ResourceManager(false, store) {
+       @Override
+       protected void doSecureLogin() throws IOException {
+       };
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestYarnClient.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestYarnClient.java
+index eb57e41..1276bb0 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestYarnClient.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestYarnClient.java
+@@ -34,7 +34,7 @@ public void test() {
+   @Test
+   public void testClientStop() {
+     Configuration conf = new Configuration();
+-    ResourceManager rm = new ResourceManager(null);
++    ResourceManager rm = new ResourceManager(false, null);
+     rm.init(conf);
+     rm.start();
+ 
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+index cbe63fd..f67fc74 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+@@ -225,19 +225,12 @@
+   public static final long    DELEGATION_TOKEN_MAX_LIFETIME_DEFAULT = 
+     7*24*60*60*1000; // 7 days
+   
++  public static final String RECOVERY_ENABLED = RM_PREFIX + "recovery.enabled";
++  public static final boolean DEFAULT_RM_RECOVERY_ENABLED = false;
+   
+   /** The class to use as the persistent store.*/
+   public static final String RM_STORE = RM_PREFIX + "store.class";
+- 
+-  /** The address of the zookeeper instance to use with ZK store.*/
+-  public static final String RM_ZK_STORE_ADDRESS = 
+-    RM_PREFIX + "zookeeper-store.address";
+-  
+-  /** The zookeeper session timeout for the zookeeper store.*/
+-  public static final String RM_ZK_STORE_TIMEOUT_MS = 
+-    RM_PREFIX + "zookeeper-store.session.timeout-ms";
+-  public static final int DEFAULT_RM_ZK_STORE_TIMEOUT_MS = 60000;
+-  
++   
+   /** The maximum number of completed applications RM keeps. */ 
+   public static final String RM_MAX_COMPLETED_APPLICATIONS =
+     RM_PREFIX + "max-completed-applications";
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+index adcf8d5..2f1d202 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+@@ -205,19 +205,14 @@
+   </property>
+ 
+   <property>
+-    <description>The class to use as the persistent store.</description>
+-    <name>yarn.resourcemanager.store.class</name>
+-  </property>
+-
+-  <property>
+-    <description>The address of the zookeeper instance to use with ZK store.</description>
+-    <name>yarn.resourcemanager.zookeeper-store.address</name>
++    <description>Enable RM to recover state after starting</description>
++    <name>yarn.resourcemanager.recovery.enabled</name>
++    <value>false</value>
+   </property>
+ 
+   <property>
+-    <description>The zookeeper session timeout for the zookeeper store.</description>
+-    <name>yarn.resourcemanager.zookeeper-store.session.timeout-ms</name>
+-    <value>60000</value>
++    <description>The class to use as the persistent store.</description>
++    <name>yarn.resourcemanager.store.class</name>
+   </property>
+ 
+   <property>
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ApplicationMasterService.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ApplicationMasterService.java
+index 96ee551..da082fa 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ApplicationMasterService.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ApplicationMasterService.java
+@@ -263,6 +263,8 @@ public AllocateResponse allocate(AllocateRequest request)
+     } else if (request.getResponseId() + 1 < lastResponse.getResponseId()) {
+       LOG.error("Invalid responseid from appAttemptId " + appAttemptId);
+       // Oh damn! Sending reboot isn't enough. RM state is corrupted. TODO:
++      // TODO Reboot is not useful since after AM reboots, it will send 
++      // TODO register and get an exception. Might as well thrown an exception here
+       allocateResponse.setAMResponse(reboot);
+       return allocateResponse;
+     } 
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ClientRMService.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ClientRMService.java
+index ec29a47..e64ff56 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ClientRMService.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ClientRMService.java
+@@ -75,6 +75,7 @@
+ import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
+ import org.apache.hadoop.yarn.server.RMDelegationTokenSecretManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEventType;
+@@ -254,6 +255,15 @@ public SubmitApplicationResponse submitApplication(
+       // So call handle directly and do not send an event.
+       rmAppManager.handle(new RMAppManagerSubmitEvent(submissionContext, System
+           .currentTimeMillis()));
++      
++      // If recovery is enabled then store the application information in a 
++      // blocking call so make sure that RM has stored the information needed 
++      // to restart the AM after RM restart without further client communication
++      RMStateStore stateStore = rmContext.getStateStore();
++      if(stateStore != null) {
++        LOG.info("Storing Application with id " + applicationId);
++        stateStore.storeApplication(rmContext.getRMApps().get(applicationId));
++      }
+ 
+       LOG.info("Application with id " + applicationId.getId() + 
+           " submitted by user " + user);
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
+index dbc28a8..4475392 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
+@@ -36,7 +36,6 @@
+ import org.apache.hadoop.yarn.ipc.RPCUtil;
+ import org.apache.hadoop.yarn.security.client.ClientTokenIdentifier;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEventType;
+@@ -251,17 +250,12 @@ protected synchronized void submitApplication(
+             YarnConfiguration.DEFAULT_APPLICATION_NAME);
+       }
+ 
+-      // Store application for recovery
+-      ApplicationStore appStore = rmContext.getApplicationsStore()
+-          .createApplicationStore(submissionContext.getApplicationId(),
+-          submissionContext);
+-
+       // Create RMApp
+       application =
+           new RMAppImpl(applicationId, rmContext, this.conf,
+             submissionContext.getApplicationName(),
+             submissionContext.getUser(), submissionContext.getQueue(),
+-            submissionContext, clientTokenStr, appStore, this.scheduler,
++            submissionContext, clientTokenStr, this.scheduler,
+             this.masterService, submitTime);
+ 
+       // Sanity check - duplicate?
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContext.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContext.java
+index ef81d9e..b487670 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContext.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContext.java
+@@ -23,8 +23,7 @@
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.NodeId;
+ import org.apache.hadoop.yarn.event.Dispatcher;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.NodeStore;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.AMLivelinessMonitor;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.ContainerAllocationExpirer;
+@@ -40,10 +39,8 @@
+ public interface RMContext {
+ 
+   Dispatcher getDispatcher();
+-
+-  NodeStore getNodeStore();
+-
+-  ApplicationsStore getApplicationsStore();
++  
++  RMStateStore getStateStore();
+ 
+   ConcurrentMap<ApplicationId, RMApp> getRMApps();
+   
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContextImpl.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContextImpl.java
+index d92b1a4..413b8f9 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContextImpl.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContextImpl.java
+@@ -24,9 +24,7 @@
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.NodeId;
+ import org.apache.hadoop.yarn.event.Dispatcher;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.NodeStore;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.AMLivelinessMonitor;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.ContainerAllocationExpirer;
+@@ -39,7 +37,6 @@
+ public class RMContextImpl implements RMContext {
+ 
+   private final Dispatcher rmDispatcher;
+-  private final Store store;
+ 
+   private final ConcurrentMap<ApplicationId, RMApp> applications
+     = new ConcurrentHashMap<ApplicationId, RMApp>();
+@@ -52,13 +49,14 @@
+ 
+   private AMLivelinessMonitor amLivelinessMonitor;
+   private AMLivelinessMonitor amFinishingMonitor;
++  private RMStateStore stateStore;
+   private ContainerAllocationExpirer containerAllocationExpirer;
+   private final DelegationTokenRenewer tokenRenewer;
+   private final ApplicationTokenSecretManager appTokenSecretManager;
+   private final RMContainerTokenSecretManager containerTokenSecretManager;
+   private final ClientToAMTokenSecretManagerInRM clientToAMTokenSecretManager;
+ 
+-  public RMContextImpl(Store store, Dispatcher rmDispatcher,
++  public RMContextImpl(Dispatcher rmDispatcher,
+       ContainerAllocationExpirer containerAllocationExpirer,
+       AMLivelinessMonitor amLivelinessMonitor,
+       AMLivelinessMonitor amFinishingMonitor,
+@@ -66,7 +64,6 @@ public RMContextImpl(Store store, Dispatcher rmDispatcher,
+       ApplicationTokenSecretManager appTokenSecretManager,
+       RMContainerTokenSecretManager containerTokenSecretManager,
+       ClientToAMTokenSecretManagerInRM clientTokenSecretManager) {
+-    this.store = store;
+     this.rmDispatcher = rmDispatcher;
+     this.containerAllocationExpirer = containerAllocationExpirer;
+     this.amLivelinessMonitor = amLivelinessMonitor;
+@@ -81,15 +78,10 @@ public RMContextImpl(Store store, Dispatcher rmDispatcher,
+   public Dispatcher getDispatcher() {
+     return this.rmDispatcher;
+   }
+-
+-  @Override
+-  public NodeStore getNodeStore() {
+-   return store;
+-  }
+-
+-  @Override
+-  public ApplicationsStore getApplicationsStore() {
+-    return store;
++  
++  @Override 
++  public RMStateStore getStateStore() {
++    return stateStore;
+   }
+ 
+   @Override
+@@ -141,4 +133,8 @@ public RMContainerTokenSecretManager getContainerTokenSecretManager() {
+   public ClientToAMTokenSecretManagerInRM getClientToAMTokenSecretManager() {
+     return this.clientToAMTokenSecretManager;
+   }
++  
++  void setStateStore(RMStateStore store) {
++    stateStore = store;
++  }
+ }
+\ No newline at end of file
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+index 2b5f73c..c28bd6e 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+@@ -20,6 +20,7 @@
+ 
+ 
+ import java.io.IOException;
++import java.util.Map;
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.LinkedBlockingQueue;
+ 
+@@ -45,13 +46,15 @@
+ import org.apache.hadoop.yarn.server.RMDelegationTokenSecretManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.ApplicationMasterLauncher;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.ApplicationState;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.Recoverable;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEventType;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.AMLivelinessMonitor;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
+@@ -119,13 +122,15 @@
+   protected RMDelegationTokenSecretManager rmDTSecretManager;
+   private WebApp webApp;
+   protected RMContext rmContext;
+-  private final Store store;
++  private final RMStateStore store;
++  private final boolean recoveryEnabled;
+   protected ResourceTrackerService resourceTracker;
+ 
+   private Configuration conf;
+ 
+-  public ResourceManager(Store store) {
++  public ResourceManager(boolean recoveryEnabled, RMStateStore store) {
+     super("ResourceManager");
++    this.recoveryEnabled = recoveryEnabled;
+     this.store = store;
+   }
+   
+@@ -142,6 +147,10 @@ public synchronized void init(Configuration conf) {
+ 
+     this.rmDispatcher = createDispatcher();
+     addIfService(this.rmDispatcher);
++    
++    if(recoveryEnabled) {
++      store.setDispatcher(rmDispatcher);
++    }
+ 
+     this.appTokenSecretManager = createApplicationTokenSecretManager(conf);
+ 
+@@ -161,10 +170,14 @@ public synchronized void init(Configuration conf) {
+     this.containerTokenSecretManager = createContainerTokenSecretManager(conf);
+     
+     this.rmContext =
+-        new RMContextImpl(this.store, this.rmDispatcher,
++        new RMContextImpl(this.rmDispatcher,
+           this.containerAllocationExpirer, amLivelinessMonitor,
+           amFinishingMonitor, tokenRenewer, this.appTokenSecretManager,
+           this.containerTokenSecretManager, this.clientToAMSecretManager);
++    
++    if(recoveryEnabled) {
++      ((RMContextImpl) rmContext).setStateStore(store);
++    }
+ 
+     // Register event handler for NodesListManager
+     this.nodesListManager = new NodesListManager(this.rmContext);
+@@ -643,8 +656,31 @@ public ApplicationTokenSecretManager getApplicationTokenSecretManager(){
+ 
+   @Override
+   public void recover(RMState state) throws Exception {
+-    resourceTracker.recover(state);
+-    scheduler.recover(state);
++    // recover applications
++    Map<ApplicationId, ApplicationState> appStates = state.getApplicationState();
++    LOG.info("Recovering " + appStates.size() + " applications");
++    for(ApplicationState appState : appStates.values()) {
++      // re-submit the application
++      // this is going to send an app start event but since the async dispatcher 
++      // has not started that event will be queued until we have completed re
++      // populating the state
++      if(appState.getApplicationSubmissionContext().getUnmanagedAM()) {
++        // do not recover unmanaged applications since current recovery 
++        // mechanism of restarting attempts does not work for them.
++        // This will need to be changed in work preserving recovery in which 
++        // RM will re-connect with the running AM's instead of restarting them
++        LOG.info("Not recovering unmanaged application " + appState.getId());
++      } else {
++        LOG.info("Recovering application " + appState.getId());
++        rmAppManager.submitApplication(
++            appState.getApplicationSubmissionContext(),
++            appState.getSubmitTime());
++        // re-populate attempt information in application
++        RMAppImpl appImpl = (RMAppImpl) rmContext.getRMApps().get(
++            appState.getId());
++        appImpl.recover(state);
++      }
++    }
+   }
+   
+   public static void main(String argv[]) {
+@@ -652,14 +688,19 @@ public static void main(String argv[]) {
+     StringUtils.startupShutdownMessage(ResourceManager.class, argv, LOG);
+     try {
+       Configuration conf = new YarnConfiguration();
+-      Store store =  StoreFactory.getStore(conf);
+-      ResourceManager resourceManager = new ResourceManager(store);
++      boolean recoveryEnabled = conf.getBoolean(
++          YarnConfiguration.RECOVERY_ENABLED,
++          YarnConfiguration.DEFAULT_RM_RECOVERY_ENABLED);
++      
++      RMStateStore store =  StoreFactory.getStore(conf);
++      ResourceManager resourceManager = new ResourceManager(recoveryEnabled, store);
+       ShutdownHookManager.get().addShutdownHook(
+         new CompositeServiceShutdownHook(resourceManager),
+         SHUTDOWN_HOOK_PRIORITY);
+       resourceManager.init(conf);
+-      //resourceManager.recover(store.restore());
+-      //store.doneWithRecovery();
++      if(recoveryEnabled) {
++        resourceManager.recover(store.loadState());
++      }
+       resourceManager.start();
+     } catch (Throwable t) {
+       LOG.fatal("Error starting ResourceManager", t);
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceTrackerService.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceTrackerService.java
+index ed4a021..7888b10 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceTrackerService.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceTrackerService.java
+@@ -44,7 +44,7 @@
+ import org.apache.hadoop.yarn.server.api.records.NodeAction;
+ import org.apache.hadoop.yarn.server.api.records.NodeStatus;
+ import org.apache.hadoop.yarn.server.api.records.RegistrationResponse;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeEventType;
+@@ -297,28 +297,6 @@ public NodeHeartbeatResponse nodeHeartbeat(NodeHeartbeatRequest request)
+     return nodeHeartBeatResponse;
+   }
+ 
+-  public void recover(RMState state) {
+-//
+-//    List<RMNode> nodeManagers = state.getStoredNodeManagers();
+-//    for (RMNode nm : nodeManagers) {
+-//      createNewNode(nm.getNodeID(), nm.getNodeHostName(), nm
+-//          .getCommandPort(), nm.getHttpPort(), nm.getNode(), nm
+-//          .getTotalCapability());
+-//    }
+-//    for (Map.Entry<ApplicationId, ApplicationInfo> entry : state
+-//        .getStoredApplications().entrySet()) {
+-//      List<Container> containers = entry.getValue().getContainers();
+-//      List<Container> containersToAdd = new ArrayList<Container>();
+-//      for (Container c : containers) {
+-//        RMNode containerNode = this.rmContext.getNodesCollection()
+-//            .getNodeInfo(c.getNodeId());
+-//        containersToAdd.add(c);
+-//        containerNode.allocateContainer(entry.getKey(), containersToAdd);
+-//        containersToAdd.clear();
+-//      }
+-//    }
+-  }
+-
+   /**
+    * resolving the network topology.
+    * @param hostName the hostname of this node.
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ApplicationsStore.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ApplicationsStore.java
+deleted file mode 100644
+index 1160c88..0000000
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ApplicationsStore.java
++++ /dev/null
+@@ -1,39 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.yarn.server.resourcemanager.recovery;
+-
+-import java.io.IOException;
+-
+-import org.apache.hadoop.yarn.api.records.ApplicationId;
+-import org.apache.hadoop.yarn.api.records.ApplicationMaster;
+-import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+-import org.apache.hadoop.yarn.api.records.Container;
+-
+-public interface ApplicationsStore {
+-  public ApplicationStore createApplicationStore(ApplicationId applicationId,
+-      ApplicationSubmissionContext context) throws IOException;
+-  public void removeApplication(ApplicationId application) throws IOException;
+- 
+-  public interface ApplicationStore {
+-    public void storeContainer(Container container) throws IOException;
+-    public void removeContainer(Container container) throws IOException;
+-    public void storeMasterContainer(Container container) throws IOException;
+-    public void updateApplicationState(ApplicationMaster master) throws IOException;
+-    public boolean isLoggable();
+-  }
+-}
+\ No newline at end of file
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/MemStore.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/MemStore.java
+deleted file mode 100644
+index 8c23f30..0000000
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/MemStore.java
++++ /dev/null
+@@ -1,128 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.yarn.server.resourcemanager.recovery;
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-
+-import org.apache.hadoop.yarn.api.records.ApplicationId;
+-import org.apache.hadoop.yarn.api.records.ApplicationMaster;
+-import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+-import org.apache.hadoop.yarn.api.records.Container;
+-import org.apache.hadoop.yarn.api.records.NodeId;
+-import org.apache.hadoop.yarn.factories.RecordFactory;
+-import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
+-import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+-
+-public class MemStore implements Store {
+-  RecordFactory recordFactory = RecordFactoryProvider.getRecordFactory(null);
+-  private NodeId nodeId;
+-  private boolean doneWithRecovery = false;
+-
+-  public MemStore() {
+-    nodeId = recordFactory.newRecordInstance(NodeId.class);
+-    nodeId.setHost("TODO");
+-    nodeId.setPort(-1);
+-  }
+-
+-  @Override
+-  public void storeNode(RMNode node) throws IOException {}
+-
+-  @Override
+-  public void removeNode(RMNode node) throws IOException {}
+-
+-  private class ApplicationStoreImpl implements ApplicationStore {
+-    @Override
+-    public void storeContainer(Container container) throws IOException {}
+-
+-    @Override
+-    public void removeContainer(Container container) throws IOException {}
+-
+-    @Override
+-    public void storeMasterContainer(Container container) throws IOException {}
+-
+-    @Override
+-    public void updateApplicationState(
+-        ApplicationMaster master) throws IOException {}
+-
+-    @Override
+-    public boolean isLoggable() {
+-      return doneWithRecovery;
+-    }
+-
+-  }
+-
+-  @Override
+-  public ApplicationStore createApplicationStore(ApplicationId application,
+-      ApplicationSubmissionContext context) throws IOException {
+-    return new ApplicationStoreImpl();
+-  }
+-
+-
+-  @Override
+-  public void removeApplication(ApplicationId application) throws IOException {}
+-
+-  @Override
+-  public RMState restore() throws IOException {
+-    MemRMState state = new MemRMState();
+-    return state;
+-  }
+-
+-  @Override
+-  public synchronized NodeId getNextNodeId() throws IOException {
+-    // TODO: FIXMEVinodkv
+-//    int num = nodeId.getId();
+-//    num++;
+-//    nodeId.setId(num);
+-    return nodeId;
+-  }
+-
+-  private class MemRMState implements RMState {
+-
+-    public MemRMState() {
+-      nodeId = recordFactory.newRecordInstance(NodeId.class);
+-    }
+-
+-    @Override
+-    public List<RMNode> getStoredNodeManagers()  {
+-      return new ArrayList<RMNode>();
+-    }
+-
+-    @Override
+-    public NodeId getLastLoggedNodeId() {
+-      return nodeId;
+-    }
+-
+-    @Override
+-    public Map<ApplicationId, ApplicationInfo> getStoredApplications() {
+-      return new HashMap<ApplicationId, Store.ApplicationInfo>();
+-    }
+-  }
+-
+-  @Override
+-  public boolean isLoggable() {
+-    return doneWithRecovery;
+-  }
+-
+-  @Override
+-  public void doneWithRecovery() {
+-    doneWithRecovery = true;
+-  }
+-}
+\ No newline at end of file
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/MemoryRMStateStore.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/MemoryRMStateStore.java
+new file mode 100644
+index 0000000..e682e6a
+--- /dev/null
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/MemoryRMStateStore.java
+@@ -0,0 +1,114 @@
++package org.apache.hadoop.yarn.server.resourcemanager.recovery;
++
++import java.util.HashMap;
++import java.util.Map;
++
++import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
++import org.apache.hadoop.yarn.api.records.ApplicationId;
++import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
++import org.apache.hadoop.yarn.api.records.Container;
++import org.apache.hadoop.yarn.event.Dispatcher;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEventType;
++
++
++public class MemoryRMStateStore implements RMStateStore {
++  
++  public class MemoryApplicationAttemptState implements ApplicationAttemptState {
++    Container masterContainer;
++
++    @Override
++    public Container getMasterContainer() {
++      return masterContainer;
++    }
++  }
++  
++  public class MemoryApplicationState implements ApplicationState {    
++    ApplicationId appId;
++    long submitTime;
++    ApplicationSubmissionContext applicationSubmissionContext;
++    HashMap<ApplicationAttemptId, MemoryApplicationAttemptState> attempts =
++        new HashMap<ApplicationAttemptId, MemoryApplicationAttemptState>();
++    
++    @Override
++    public ApplicationId getId() {
++      return appId;
++    }
++
++    @Override
++    public long getSubmitTime() {
++      return submitTime;
++    }
++
++    @Override
++    public ApplicationSubmissionContext getApplicationSubmissionContext() {
++      return applicationSubmissionContext;
++    }
++
++    @Override
++    public int getAttemptCount() {
++      return attempts.size();
++    }
++
++    @Override
++    public ApplicationAttemptState getAttempt(ApplicationAttemptId attemptId) {
++      MemoryApplicationAttemptState attemptState = attempts.get(attemptId);
++      return attemptState;
++    }
++    
++  }
++  
++  public class MemoryRMState implements RMState {
++    HashMap<ApplicationId, ApplicationState> appState = 
++        new HashMap<ApplicationId, ApplicationState>();
++
++    @Override
++    public Map<ApplicationId, ApplicationState> getApplicationState() {
++      return appState;
++    }
++    
++  }
++  
++  MemoryRMState state = new MemoryRMState();
++  
++  Dispatcher dispatcher;
++  
++  @Override
++  public void setDispatcher(Dispatcher dispatcher) {
++    this.dispatcher = dispatcher;
++  }
++  
++  @Override
++  public RMState loadState() {
++    return state;
++  }
++
++  @Override
++  public void storeApplication(RMApp app) {
++    MemoryApplicationState storedApp = new MemoryApplicationState();
++    storedApp.appId = app.getApplicationId();
++    storedApp.submitTime = app.getSubmitTime();
++    storedApp.applicationSubmissionContext = app.getApplicationSubmissionContext();
++    state.appState.put(app.getApplicationId(), storedApp);
++  }
++
++  @SuppressWarnings("unchecked")
++  @Override
++  public void storeApplicationAttempt(RMAppAttempt appAttempt) {
++    MemoryApplicationState appState = (MemoryApplicationState) 
++    state.getApplicationState().get(appAttempt.getAppAttemptId().getApplicationId());
++    assert appState != null;
++    
++    MemoryApplicationAttemptState attemptState = new MemoryApplicationAttemptState();
++    attemptState.masterContainer = appAttempt.getMasterContainer();
++    appState.attempts.put(appAttempt.getAppAttemptId(), attemptState);
++        
++    //TODO move this to base class method and remove java imports
++    dispatcher.getEventHandler().handle(
++        new RMAppAttemptEvent(appAttempt.getAppAttemptId(), 
++                              RMAppAttemptEventType.ATTEMPT_SAVED));
++  }
++
++}
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/NodeStore.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/NodeStore.java
+deleted file mode 100644
+index cc11eec..0000000
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/NodeStore.java
++++ /dev/null
+@@ -1,32 +0,0 @@
+-/**
+-* Licensed to the Apache Software Foundation (ASF) under one
+-* or more contributor license agreements.  See the NOTICE file
+-* distributed with this work for additional information
+-* regarding copyright ownership.  The ASF licenses this file
+-* to you under the Apache License, Version 2.0 (the
+-* "License"); you may not use this file except in compliance
+-* with the License.  You may obtain a copy of the License at
+-*
+-*     http://www.apache.org/licenses/LICENSE-2.0
+-*
+-* Unless required by applicable law or agreed to in writing, software
+-* distributed under the License is distributed on an "AS IS" BASIS,
+-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-* See the License for the specific language governing permissions and
+-* limitations under the License.
+-*/
+-
+-package org.apache.hadoop.yarn.server.resourcemanager.recovery;
+-
+-import java.io.IOException;
+-
+-import org.apache.hadoop.yarn.api.records.NodeId;
+-import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+-
+-
+-public interface NodeStore {
+-  public void storeNode(RMNode node) throws IOException;
+-  public void removeNode(RMNode node) throws IOException;
+-  public NodeId getNextNodeId() throws IOException;
+-  public boolean isLoggable();
+-}
+\ No newline at end of file
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+new file mode 100644
+index 0000000..320e78f
+--- /dev/null
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+@@ -0,0 +1,67 @@
++/**
++* Licensed to the Apache Software Foundation (ASF) under one
++* or more contributor license agreements.  See the NOTICE file
++* distributed with this work for additional information
++* regarding copyright ownership.  The ASF licenses this file
++* to you under the Apache License, Version 2.0 (the
++* "License"); you may not use this file except in compliance
++* with the License.  You may obtain a copy of the License at
++*
++*     http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++package org.apache.hadoop.yarn.server.resourcemanager.recovery;
++
++import java.util.Map;
++
++import org.apache.hadoop.classification.InterfaceAudience.Private;
++import org.apache.hadoop.classification.InterfaceStability.Unstable;
++import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
++import org.apache.hadoop.yarn.api.records.ApplicationId;
++import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
++import org.apache.hadoop.yarn.api.records.Container;
++import org.apache.hadoop.yarn.event.Dispatcher;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
++
++@Private
++@Unstable
++public interface RMStateStore {
++  
++  public interface ApplicationAttemptState {
++    Container getMasterContainer();
++  }
++  
++  public interface ApplicationState {
++    ApplicationId getId();
++    long getSubmitTime();
++    ApplicationSubmissionContext getApplicationSubmissionContext();
++    int getAttemptCount();
++    ApplicationAttemptState getAttempt(ApplicationAttemptId attemptId);
++  }
++  
++  public interface RMState {
++    Map<ApplicationId, ApplicationState> getApplicationState();
++  }
++  
++  void setDispatcher(Dispatcher dispatcher);
++  
++  RMState loadState();
++  
++  /**
++   * Blocking API
++   */
++  void storeApplication(RMApp app);
++  
++  /**
++   * Non-blocking API
++   */
++  void storeApplicationAttempt(RMAppAttempt appAttempt);
++
++}
+\ No newline at end of file
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/Recoverable.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/Recoverable.java
+index 2dccf59..23ca92e 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/Recoverable.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/Recoverable.java
+@@ -17,7 +17,7 @@
+ */
+ package org.apache.hadoop.yarn.server.resourcemanager.recovery;
+ 
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
+ 
+ public interface Recoverable {
+   public void recover(RMState state) throws Exception;
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/Store.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/Store.java
+deleted file mode 100644
+index b784c71..0000000
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/Store.java
++++ /dev/null
+@@ -1,46 +0,0 @@
+-/**
+-* Licensed to the Apache Software Foundation (ASF) under one
+-* or more contributor license agreements.  See the NOTICE file
+-* distributed with this work for additional information
+-* regarding copyright ownership.  The ASF licenses this file
+-* to you under the Apache License, Version 2.0 (the
+-* "License"); you may not use this file except in compliance
+-* with the License.  You may obtain a copy of the License at
+-*
+-*     http://www.apache.org/licenses/LICENSE-2.0
+-*
+-* Unless required by applicable law or agreed to in writing, software
+-* distributed under the License is distributed on an "AS IS" BASIS,
+-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-* See the License for the specific language governing permissions and
+-* limitations under the License.
+-*/
+-package org.apache.hadoop.yarn.server.resourcemanager.recovery;
+-
+-import java.io.IOException;
+-import java.util.List;
+-import java.util.Map;
+-
+-import org.apache.hadoop.yarn.api.records.ApplicationId;
+-import org.apache.hadoop.yarn.api.records.ApplicationMaster;
+-import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+-import org.apache.hadoop.yarn.api.records.Container;
+-import org.apache.hadoop.yarn.api.records.NodeId;
+-import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+-
+-
+-public interface Store extends NodeStore, ApplicationsStore {
+-  public interface ApplicationInfo {
+-    public ApplicationMaster getApplicationMaster();
+-    public Container getMasterContainer();
+-    public ApplicationSubmissionContext getApplicationSubmissionContext();
+-    public List<Container> getContainers();
+-  }
+-  public interface RMState {
+-    public List<RMNode> getStoredNodeManagers() ;
+-    public Map<ApplicationId, ApplicationInfo> getStoredApplications();
+-    public NodeId getLastLoggedNodeId();
+-  }
+-  public RMState restore() throws IOException;
+-  public void doneWithRecovery();
+-}
+\ No newline at end of file
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/StoreFactory.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/StoreFactory.java
+index 91b33ca..bc18b47 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/StoreFactory.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/StoreFactory.java
+@@ -17,53 +17,17 @@
+ */
+ package org.apache.hadoop.yarn.server.resourcemanager.recovery;
+ 
+-import java.io.IOException;
+-
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.util.ReflectionUtils;
+-import org.apache.hadoop.yarn.api.records.ApplicationMaster;
+-import org.apache.hadoop.yarn.api.records.Container;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+ 
+ public class StoreFactory {
+   
+-  public static Store getStore(Configuration conf) {
+-    Store store = ReflectionUtils.newInstance(
++  public static RMStateStore getStore(Configuration conf) {
++    RMStateStore store = ReflectionUtils.newInstance(
+         conf.getClass(YarnConfiguration.RM_STORE, 
+-            MemStore.class, Store.class), 
++            MemoryRMStateStore.class, RMStateStore.class), 
+             conf);
+     return store;
+   }
+-  
+-  public static ApplicationStore createVoidAppStore() {
+-    return new VoidApplicationStore();
+-  }
+-  
+-  private static class VoidApplicationStore implements ApplicationStore {
+-
+-    public VoidApplicationStore() {}
+-    
+-    @Override
+-    public void storeContainer(Container container) throws IOException {
+-    }
+-
+-    @Override
+-    public void removeContainer(Container container) throws IOException {
+-    }
+-
+-    @Override
+-    public void storeMasterContainer(Container container) throws IOException {
+-    }
+-
+-    @Override
+-    public void updateApplicationState(ApplicationMaster master)
+-        throws IOException {
+-    }
+-
+-    @Override
+-    public boolean isLoggable() {
+-      return false;
+-    }
+-  }
+ }
+\ No newline at end of file
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKStore.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKStore.java
+deleted file mode 100644
+index f2e401a..0000000
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKStore.java
++++ /dev/null
+@@ -1,509 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.yarn.server.resourcemanager.recovery;
+-
+-import java.io.IOException;
+-import java.io.InterruptedIOException;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.regex.Matcher;
+-import java.util.regex.Pattern;
+-
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.yarn.api.records.ApplicationId;
+-import org.apache.hadoop.yarn.api.records.ApplicationMaster;
+-import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+-import org.apache.hadoop.yarn.api.records.Container;
+-import org.apache.hadoop.yarn.api.records.ContainerId;
+-import org.apache.hadoop.yarn.api.records.NodeId;
+-import org.apache.hadoop.yarn.api.records.NodeReport;
+-import org.apache.hadoop.yarn.api.records.impl.pb.ApplicationMasterPBImpl;
+-import org.apache.hadoop.yarn.api.records.impl.pb.ApplicationSubmissionContextPBImpl;
+-import org.apache.hadoop.yarn.api.records.impl.pb.ContainerPBImpl;
+-import org.apache.hadoop.yarn.api.records.impl.pb.NodeIdPBImpl;
+-import org.apache.hadoop.yarn.api.records.impl.pb.NodeReportPBImpl;
+-import org.apache.hadoop.yarn.conf.YarnConfiguration;
+-import org.apache.hadoop.yarn.factories.RecordFactory;
+-import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
+-import org.apache.hadoop.yarn.proto.YarnProtos.ApplicationMasterProto;
+-import org.apache.hadoop.yarn.proto.YarnProtos.ApplicationSubmissionContextProto;
+-import org.apache.hadoop.yarn.proto.YarnProtos.ContainerProto;
+-import org.apache.hadoop.yarn.proto.YarnProtos.NodeIdProto;
+-import org.apache.hadoop.yarn.proto.YarnProtos.NodeReportProto;
+-import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+-import org.apache.hadoop.yarn.util.ConverterUtils;
+-import org.apache.zookeeper.CreateMode;
+-import org.apache.zookeeper.KeeperException;
+-import org.apache.zookeeper.WatchedEvent;
+-import org.apache.zookeeper.Watcher;
+-import org.apache.zookeeper.ZooKeeper;
+-import org.apache.zookeeper.data.Stat;
+-
+-public class ZKStore implements Store {
+-  private final Configuration conf;
+-  private final ZooKeeper zkClient;
+-  private static final Log LOG = LogFactory.getLog(ZKStore.class);
+-  private final RecordFactory recordFactory = RecordFactoryProvider.getRecordFactory(null);
+-  private static final String NODES = "nodes/";
+-  private static final String APPS = "apps/";
+-  private static final String ZK_PATH_SEPARATOR = "/";
+-  private static final String NODE_ID = "nodeid";
+-  private static final String APP_MASTER = "master";
+-  private static final String APP_MASTER_CONTAINER = "mastercontainer";
+-  private final String ZK_ADDRESS;
+-  private final int ZK_TIMEOUT;
+-  private boolean doneWithRecovery = false;
+-  
+-  /** TODO make this generic **/
+-  private NodeIdPBImpl nodeId = new NodeIdPBImpl();
+-
+-  /**
+-   * TODO fix this for later to handle all kinds of events 
+-   * of connection and session events.
+-   *
+-   */
+-  private static class ZKWatcher implements Watcher {
+-    @Override
+-    public void process(WatchedEvent arg0) {
+-    }
+-  }
+-
+-  public ZKStore(Configuration conf) throws IOException {
+-    this.conf = conf;
+-    this.ZK_ADDRESS = conf.get(YarnConfiguration.RM_ZK_STORE_ADDRESS);
+-    this.ZK_TIMEOUT = conf.getInt(YarnConfiguration.RM_ZK_STORE_TIMEOUT_MS,
+-        YarnConfiguration.DEFAULT_RM_ZK_STORE_TIMEOUT_MS);
+-    zkClient = new ZooKeeper(this.ZK_ADDRESS, 
+-        this.ZK_TIMEOUT,
+-        createZKWatcher() 
+-    );
+-    // TODO: FIXMEVinodkv
+-//    this.nodeId.setId(0);
+-  }
+-
+-  protected Watcher createZKWatcher() {
+-    return new ZKWatcher();   
+-  }
+-
+-  private NodeReportPBImpl createNodeManagerInfo(RMNode rmNode) {
+-    NodeReport node = 
+-      recordFactory.newRecordInstance(NodeReport.class);
+-    node.setNodeId(rmNode.getNodeID());
+-    node.setRackName(rmNode.getRackName());
+-    node.setCapability(rmNode.getTotalCapability());
+-    // TODO: FIXME
+-//    node.setUsed(nodeInfo.getUsedResource());
+-    // TODO: acm: refactor2 FIXME
+-//  node.setNumContainers(rmNode.getNumContainers());
+-    return (NodeReportPBImpl)node;
+-  }
+-
+-  @Override
+-  public synchronized void storeNode(RMNode node) throws IOException {
+-    /** create a storage node and store it in zk **/
+-    if (!doneWithRecovery) return;
+-    // TODO: FIXMEVinodkv
+-//    NodeReportPBImpl nodeManagerInfo = createNodeManagerInfo(node);
+-//    byte[] bytes = nodeManagerInfo.getProto().toByteArray();
+-//    try {
+-//      zkClient.create(NODES + Integer.toString(node.getNodeID().getId()), bytes, null,
+-//          CreateMode.PERSISTENT);
+-//    } catch(InterruptedException ie) {
+-//      LOG.info("Interrupted", ie);
+-//      throw new InterruptedIOException("Interrupted");
+-//    } catch(KeeperException ke) {
+-//      LOG.info("Keeper exception", ke);
+-//      throw convertToIOException(ke);
+-//    }
+-  }
+-
+-  @Override
+-  public synchronized void removeNode(RMNode node) throws IOException {
+-    if (!doneWithRecovery) return;
+-    
+-//    TODO: FIXME VINODKV
+-//    /** remove a storage node **/
+-//    try {
+-//      zkClient.delete(NODES + Integer.toString(node.getNodeID().getId()), -1);
+-//    } catch(InterruptedException ie) {
+-//      LOG.info("Interrupted", ie);
+-//      throw new InterruptedIOException("Interrupted");
+-//    } catch(KeeperException ke) {
+-//      LOG.info("Keeper exception", ke);
+-//      throw convertToIOException(ke);
+-//    }
+-
+-  }
+-
+-  private static IOException convertToIOException(KeeperException ke) {
+-    IOException io = new IOException();
+-    io.setStackTrace(ke.getStackTrace());
+-    return io;
+-  }
+-
+-  @Override
+-  public synchronized NodeId getNextNodeId() throws IOException {
+-//    TODO: FIXME VINODKV
+-//    int num = nodeId.getId();
+-//    num++;
+-//    nodeId.setId(num);
+-//    try {
+-//      zkClient.setData(NODES + NODE_ID, nodeId.getProto().toByteArray() , -1);
+-//    } catch(InterruptedException ie) {
+-//      LOG.info("Interrupted", ie);
+-//      throw new InterruptedIOException(ie.getMessage());
+-//    } catch(KeeperException ke) {
+-//      throw convertToIOException(ke);
+-//    }
+-    return nodeId;
+-  }
+-
+-  private String containerPathFromContainerId(ContainerId containerId) {
+-    String appString = ConverterUtils.toString(
+-        containerId.getApplicationAttemptId().getApplicationId());
+-    return appString + "/" + containerId.getId();
+-  }
+-
+-  private class ZKApplicationStore implements ApplicationStore {
+-    private final ApplicationId applicationId;
+-
+-    public ZKApplicationStore(ApplicationId applicationId) {
+-      this.applicationId = applicationId;
+-    }
+-
+-    @Override
+-    public void storeMasterContainer(Container container) throws IOException {
+-      if (!doneWithRecovery) return;
+-      
+-      ContainerPBImpl containerPBImpl = (ContainerPBImpl) container;
+-      try {
+-        zkClient.setData(APPS + 
+-            ConverterUtils.toString(
+-                container.getId().getApplicationAttemptId().getApplicationId()) 
+-                +
+-            ZK_PATH_SEPARATOR + APP_MASTER_CONTAINER
+-            , containerPBImpl.getProto().toByteArray(), -1);
+-      } catch(InterruptedException ie) {
+-        LOG.info("Interrupted", ie);
+-        throw new InterruptedIOException(ie.getMessage());
+-      } catch(KeeperException ke) {
+-        LOG.info("Keeper exception", ke);
+-        throw convertToIOException(ke);
+-      }
+-    }
+-    @Override
+-    public synchronized void storeContainer(Container container) throws IOException {
+-      if (!doneWithRecovery) return;
+-      
+-      ContainerPBImpl containerPBImpl = (ContainerPBImpl) container;
+-      try {
+-        zkClient.create(APPS + containerPathFromContainerId(container.getId())
+-            , containerPBImpl.getProto().toByteArray(), null, CreateMode.PERSISTENT);
+-      } catch(InterruptedException ie) {
+-        LOG.info("Interrupted", ie);
+-        throw new InterruptedIOException(ie.getMessage());
+-      } catch(KeeperException ke) {
+-        LOG.info("Keeper exception", ke);
+-        throw convertToIOException(ke);
+-      }
+-    }
+-
+-    @Override
+-    public synchronized void removeContainer(Container container) throws IOException {
+-      if (!doneWithRecovery) return;
+-      try { 
+-        zkClient.delete(APPS + containerPathFromContainerId(container.getId()),
+-            -1);
+-      } catch(InterruptedException ie) {
+-        throw new InterruptedIOException(ie.getMessage());
+-      } catch(KeeperException ke) {
+-        LOG.info("Keeper exception", ke);
+-        throw convertToIOException(ke);
+-      }
+-    }
+-
+-    @Override
+-    public void updateApplicationState(
+-        ApplicationMaster master) throws IOException {
+-      if (!doneWithRecovery) return;
+-      
+-      String appString = APPS + ConverterUtils.toString(applicationId);
+-      ApplicationMasterPBImpl masterPBImpl = (ApplicationMasterPBImpl) master;
+-      try {
+-        zkClient.setData(appString, masterPBImpl.getProto().toByteArray(), -1);
+-      } catch(InterruptedException ie) {
+-        LOG.info("Interrupted", ie);
+-        throw new InterruptedIOException(ie.getMessage());
+-      } catch(KeeperException ke) {
+-        LOG.info("Keeper exception", ke);
+-        throw convertToIOException(ke);
+-      }
+-    }
+-
+-    @Override
+-    public boolean isLoggable() {
+-      return doneWithRecovery;
+-    }
+-  }
+-
+-  @Override
+-  public synchronized ApplicationStore createApplicationStore(ApplicationId application, 
+-      ApplicationSubmissionContext context) throws IOException {
+-    if (!doneWithRecovery) return new ZKApplicationStore(application);
+-    
+-    ApplicationSubmissionContextPBImpl contextPBImpl = (ApplicationSubmissionContextPBImpl) context;
+-    String appString = APPS + ConverterUtils.toString(application);
+-   
+-    ApplicationMasterPBImpl masterPBImpl = new ApplicationMasterPBImpl();
+-    ContainerPBImpl container = new ContainerPBImpl();
+-    try {
+-      zkClient.create(appString, contextPBImpl.getProto()
+-          .toByteArray(), null, CreateMode.PERSISTENT);
+-      zkClient.create(appString + ZK_PATH_SEPARATOR + APP_MASTER, 
+-          masterPBImpl.getProto().toByteArray(), null, CreateMode.PERSISTENT);
+-      zkClient.create(appString + ZK_PATH_SEPARATOR + APP_MASTER_CONTAINER, 
+-          container.getProto().toByteArray(), null, CreateMode.PERSISTENT);
+-    } catch(InterruptedException ie) {
+-      LOG.info("Interrupted", ie);
+-      throw new InterruptedIOException(ie.getMessage());
+-    } catch(KeeperException ke) {
+-      LOG.info("Keeper exception", ke);
+-      throw convertToIOException(ke);
+-    }
+-    return new ZKApplicationStore(application);
+-  }
+-
+-  @Override
+-  public synchronized void removeApplication(ApplicationId application) throws IOException {
+-    if (!doneWithRecovery) return;
+-    
+-    try {
+-      zkClient.delete(APPS + ConverterUtils.toString(application), -1);
+-    } catch(InterruptedException ie) {
+-      LOG.info("Interrupted", ie);
+-      throw new InterruptedIOException(ie.getMessage());
+-    } catch(KeeperException ke) {
+-      LOG.info("Keeper Exception", ke);
+-      throw convertToIOException(ke);
+-    }
+-  }
+-
+-  @Override
+-  public boolean isLoggable() {
+-    return doneWithRecovery;
+-  }
+-
+-  @Override
+-  public void doneWithRecovery() {
+-    this.doneWithRecovery = true;
+-  }
+-
+-  
+-  @Override
+-  public synchronized RMState restore() throws IOException {
+-    ZKRMState rmState = new ZKRMState();
+-    rmState.load();
+-    return rmState;
+-  }  
+-
+-  private static class ApplicationInfoImpl implements ApplicationInfo {
+-    private ApplicationMaster master;
+-    private Container masterContainer;
+-
+-    private final ApplicationSubmissionContext context;
+-    private final List<Container> containers = new ArrayList<Container>();
+-
+-    public ApplicationInfoImpl(ApplicationSubmissionContext context) {
+-      this.context = context;
+-    }
+-
+-    public void setApplicationMaster(ApplicationMaster master) {
+-      this.master = master;
+-    }
+-
+-    public void setMasterContainer(Container container) {
+-      this.masterContainer = container;
+-    }
+-
+-    @Override
+-    public ApplicationMaster getApplicationMaster() {
+-      return this.master;
+-    }
+-
+-    @Override
+-    public ApplicationSubmissionContext getApplicationSubmissionContext() {
+-      return this.context;
+-    }
+-
+-    @Override
+-    public Container getMasterContainer() {
+-      return this.masterContainer;
+-    }
+-
+-    @Override
+-    public List<Container> getContainers() {
+-      return this.containers;
+-    }
+-
+-    public void addContainer(Container container) {
+-      containers.add(container);
+-    }
+-  }
+-
+-  private class ZKRMState implements RMState {
+-    private List<RMNode> nodeManagers = new ArrayList<RMNode>();
+-    private Map<ApplicationId, ApplicationInfo> applications = new 
+-    HashMap<ApplicationId, ApplicationInfo>();
+-
+-    public ZKRMState() {
+-      LOG.info("Restoring RM state from ZK");
+-    }
+-
+-    private synchronized List<NodeReport> listStoredNodes() throws IOException {
+-      /** get the list of nodes stored in zk **/
+-      //TODO PB
+-      List<NodeReport> nodes = new ArrayList<NodeReport>();
+-      Stat stat = new Stat();
+-      try {
+-        List<String> children = zkClient.getChildren(NODES, false);
+-        for (String child: children) {
+-          byte[] data = zkClient.getData(NODES + child, false, stat);
+-          NodeReportPBImpl nmImpl = new NodeReportPBImpl(
+-              NodeReportProto.parseFrom(data));
+-          nodes.add(nmImpl);
+-        }
+-      } catch (InterruptedException ie) {
+-        LOG.info("Interrupted" , ie);
+-        throw new InterruptedIOException("Interrupted");
+-      } catch(KeeperException ke) {
+-        LOG.error("Failed to list nodes", ke);
+-        throw convertToIOException(ke);
+-      }
+-      return nodes;
+-    }
+-
+-    @Override
+-    public List<RMNode> getStoredNodeManagers()  {
+-      return nodeManagers;
+-    }
+-
+-    @Override
+-    public NodeId getLastLoggedNodeId() {
+-      return nodeId;
+-    }
+-
+-    private void readLastNodeId() throws IOException {
+-      Stat stat = new Stat();
+-      try {
+-        byte[] data = zkClient.getData(NODES + NODE_ID, false, stat);
+-        nodeId = new NodeIdPBImpl(NodeIdProto.parseFrom(data));
+-      } catch(InterruptedException ie) {
+-        LOG.info("Interrupted", ie);
+-        throw new InterruptedIOException(ie.getMessage());
+-      } catch(KeeperException ke) {
+-        LOG.info("Keeper Exception", ke);
+-        throw convertToIOException(ke);
+-      }
+-    }
+-
+-    private ApplicationInfo getAppInfo(String app) throws IOException {
+-      ApplicationInfoImpl info = null;
+-      Stat stat = new Stat();
+-      try {
+-        ApplicationSubmissionContext context = null;
+-        byte[] data = zkClient.getData(APPS + app, false, stat);
+-        context = new ApplicationSubmissionContextPBImpl(
+-            ApplicationSubmissionContextProto.parseFrom(data));
+-        info = new ApplicationInfoImpl(context);
+-        List<String> children = zkClient.getChildren(APPS + app, false, stat);
+-        ApplicationMaster master = null;
+-        for (String child: children) {
+-          byte[] childdata = zkClient.getData(APPS + app + ZK_PATH_SEPARATOR + child, false, stat);
+-          if (APP_MASTER.equals(child)) {
+-            master = new ApplicationMasterPBImpl(ApplicationMasterProto.parseFrom(childdata));
+-            info.setApplicationMaster(master);
+-          } else if (APP_MASTER_CONTAINER.equals(child)) {
+-            Container masterContainer = new ContainerPBImpl(ContainerProto.parseFrom(data));
+-            info.setMasterContainer(masterContainer);
+-          } else {
+-            Container container = new ContainerPBImpl(ContainerProto.parseFrom(data));
+-            info.addContainer(container);
+-          }
+-        }
+-      } catch(InterruptedException ie) {
+-        LOG.info("Interrupted", ie);
+-        throw new InterruptedIOException(ie.getMessage());
+-      } catch(KeeperException ke) {
+-        throw convertToIOException(ke);
+-      }
+-      return info;
+-    }
+-
+-    private void load() throws IOException {
+-      List<NodeReport> nodeInfos = listStoredNodes();
+-      final Pattern trackerPattern = Pattern.compile(".*:.*");
+-      final Matcher m = trackerPattern.matcher("");
+-      for (NodeReport node: nodeInfos) {
+-        m.reset(node.getNodeId().getHost());
+-        if (!m.find()) {
+-          LOG.info("Skipping node, bad node-address "
+-              + node.getNodeId().getHost());
+-          continue;
+-        }
+-        String hostName = m.group(0);
+-        int cmPort = Integer.valueOf(m.group(1));
+-        m.reset(node.getHttpAddress());
+-        if (!m.find()) {
+-          LOG.info("Skipping node, bad http-address " + node.getHttpAddress());
+-          continue;
+-        }
+-        int httpPort = Integer.valueOf(m.group(1));
+-        // TODO: FindBugs warns passing null below. Commenting this for later.
+-//        RMNode nm = new RMNodeImpl(node.getNodeId(), null,
+-//            hostName, cmPort, httpPort,
+-//            ResourceTrackerService.resolve(node.getNodeId().getHost()), 
+-//            node.getCapability());
+-//        nodeManagers.add(nm);
+-      }
+-      readLastNodeId();
+-      /* make sure we get all the applications */
+-      List<String> apps = null;
+-      try {
+-        apps = zkClient.getChildren(APPS, false);
+-      } catch(InterruptedException ie) {
+-        LOG.info("Interrupted", ie);
+-        throw new InterruptedIOException(ie.getMessage());
+-      } catch(KeeperException ke) {
+-        throw convertToIOException(ke);
+-      }
+-      for (String app: apps) {
+-        ApplicationInfo info = getAppInfo(app);
+-        applications.put(info.getApplicationMaster().getApplicationId(), info);
+-      }
+-    }
+-
+-    @Override
+-    public Map<ApplicationId, ApplicationInfo> getStoredApplications() {
+-      return applications;
+-    }
+-  }
+-}
+\ No newline at end of file
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMApp.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMApp.java
+index 63ff844..92bc2b6 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMApp.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMApp.java
+@@ -29,7 +29,6 @@
+ import org.apache.hadoop.yarn.api.records.ApplicationReport;
+ import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+ import org.apache.hadoop.yarn.event.EventHandler;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+ 
+@@ -45,6 +44,12 @@
+    * @return the {@link ApplicationId} for this {@link RMApp}.
+    */
+   ApplicationId getApplicationId();
++  
++  /**
++   * The application submission context for this {@link RMApp}
++   * @return the {@link ApplicationSubmissionContext} for this {@link RMApp}
++   */
++  ApplicationSubmissionContext getApplicationSubmissionContext();
+ 
+   /**
+    * The current state of the {@link RMApp}.
+@@ -132,13 +137,6 @@
+   int pullRMNodeUpdates(Collection<RMNode> updatedNodes);
+ 
+   /**
+-   * Application level metadata is stored in {@link ApplicationStore} which
+-   * can persist the information.
+-   * @return the {@link ApplicationStore}  for this {@link RMApp}.
+-   */
+-  ApplicationStore getApplicationStore();
+-
+-  /**
+    * The finish time of the {@link RMApp}
+    * @return the finish time of the application.,
+    */
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java
+index f3fe054..4933ed1 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java
+@@ -49,8 +49,10 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAppManagerEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAppManagerEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppNodeUpdateEvent.RMAppNodeUpdateType;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.ApplicationState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.Recoverable;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
+@@ -67,7 +69,7 @@
+ import org.apache.hadoop.yarn.util.BuilderUtils;
+ import org.apache.hadoop.yarn.util.Records;
+ 
+-public class RMAppImpl implements RMApp {
++public class RMAppImpl implements RMApp, Recoverable {
+ 
+   private static final Log LOG = LogFactory.getLog(RMAppImpl.class);
+   private static final String UNAVAILABLE = "N/A";
+@@ -81,7 +83,6 @@
+   private final String name;
+   private final ApplicationSubmissionContext submissionContext;
+   private final String clientTokenStr;
+-  private final ApplicationStore appStore;
+   private final Dispatcher dispatcher;
+   private final YarnScheduler scheduler;
+   private final ApplicationMasterService masterService;
+@@ -213,7 +214,6 @@
+   public RMAppImpl(ApplicationId applicationId, RMContext rmContext,
+       Configuration config, String name, String user, String queue,
+       ApplicationSubmissionContext submissionContext, String clientTokenStr,
+-      ApplicationStore appStore,
+       YarnScheduler scheduler, ApplicationMasterService masterService, 
+       long submitTime) {
+ 
+@@ -227,7 +227,6 @@ public RMAppImpl(ApplicationId applicationId, RMContext rmContext,
+     this.queue = queue;
+     this.submissionContext = submissionContext;
+     this.clientTokenStr = clientTokenStr;
+-    this.appStore = appStore;
+     this.scheduler = scheduler;
+     this.masterService = masterService;
+     this.submitTime = submitTime;
+@@ -247,6 +246,11 @@ public RMAppImpl(ApplicationId applicationId, RMContext rmContext,
+   public ApplicationId getApplicationId() {
+     return this.applicationId;
+   }
++  
++  @Override
++  public ApplicationSubmissionContext getApplicationSubmissionContext() {
++    return this.submissionContext;
++  }
+ 
+   @Override
+   public FinalApplicationStatus getFinalApplicationStatus() {
+@@ -340,11 +344,6 @@ public RMAppAttempt getCurrentAppAttempt() {
+     }
+   }
+ 
+-  @Override
+-  public ApplicationStore getApplicationStore() {
+-    return this.appStore;
+-  }
+-
+   private YarnApplicationState createApplicationState(RMAppState rmAppState) {
+     switch(rmAppState) {
+     case NEW:
+@@ -521,9 +520,23 @@ public void handle(RMAppEvent event) {
+       this.writeLock.unlock();
+     }
+   }
++  
++  @Override
++  public void recover(RMState state) {
++    ApplicationState appState = state.getApplicationState().get(getApplicationId());
++    LOG.info("Recovering app: " + getApplicationId() + " with " + 
++            + appState.getAttemptCount() + " attempts");
++    for(int i=0; i<appState.getAttemptCount(); ++i) {
++      // create attempt
++      createNewAttempt(false);
++      // recover attempt
++      ((RMAppAttemptImpl) currentAttempt).recover(state);
++      // TODO transition app state to killed/failed and set status
++    }
++  }
+ 
+   @SuppressWarnings("unchecked")
+-  private void createNewAttempt() {
++  private void createNewAttempt(boolean startAttempt) {
+     ApplicationAttemptId appAttemptId = Records
+         .newRecord(ApplicationAttemptId.class);
+     appAttemptId.setApplicationId(applicationId);
+@@ -534,8 +547,10 @@ private void createNewAttempt() {
+         submissionContext, conf);
+     attempts.put(appAttemptId, attempt);
+     currentAttempt = attempt;
+-    handler.handle(
+-        new RMAppAttemptEvent(appAttemptId, RMAppAttemptEventType.START));
++    if(startAttempt) {
++      handler.handle(
++          new RMAppAttemptEvent(appAttemptId, RMAppAttemptEventType.START));
++    }
+   }
+   
+   private void processNodeUpdate(RMAppNodeUpdateType type, RMNode node) {
+@@ -562,7 +577,7 @@ public void transition(RMAppImpl app, RMAppEvent event) {
+   
+   private static final class StartAppAttemptTransition extends RMAppTransition {
+     public void transition(RMAppImpl app, RMAppEvent event) {
+-      app.createNewAttempt();
++      app.createNewAttempt(true);
+     };
+   }
+ 
+@@ -664,7 +679,7 @@ public RMAppState transition(RMAppImpl app, RMAppEvent event) {
+       }
+ 
+       if (retryApp) {
+-        app.createNewAttempt();
++        app.createNewAttempt(true);
+         return initialState;
+       } else {
+         LOG.info(msg);
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptEventType.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptEventType.java
+index 99287a3..9ee0466 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptEventType.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptEventType.java
+@@ -39,6 +39,9 @@
+   CONTAINER_ACQUIRED,
+   CONTAINER_ALLOCATED,
+   CONTAINER_FINISHED,
++  
++  // Source: RMStateStore
++  ATTEMPT_SAVED,
+ 
+   // Source: Scheduler
+   APP_REJECTED,
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java
+index eebbecb..e278098 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptImpl.java
+@@ -56,6 +56,11 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEventType;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.ApplicationAttemptState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.ApplicationState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.Recoverable;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEventType;
+@@ -84,7 +89,7 @@
+ import org.apache.hadoop.yarn.util.BuilderUtils;
+ 
+ @SuppressWarnings({"unchecked", "rawtypes"})
+-public class RMAppAttemptImpl implements RMAppAttempt {
++public class RMAppAttemptImpl implements RMAppAttempt, Recoverable {
+ 
+   private static final Log LOG = LogFactory.getLog(RMAppAttemptImpl.class);
+ 
+@@ -169,12 +174,26 @@
+           
+        // Transitions from SCHEDULED State
+       .addTransition(RMAppAttemptState.SCHEDULED,
+-          RMAppAttemptState.ALLOCATED,
++          EnumSet.of(RMAppAttemptState.ALLOCATED, 
++                     RMAppAttemptState.ALLOCATED_SAVING),
+           RMAppAttemptEventType.CONTAINER_ALLOCATED,
+           new AMContainerAllocatedTransition())
+       .addTransition(RMAppAttemptState.SCHEDULED, RMAppAttemptState.KILLED,
+           RMAppAttemptEventType.KILL,
+           new BaseFinalTransition(RMAppAttemptState.KILLED))
++          
++       // Transitions from ALLOCATED_SAVING State
++      .addTransition(RMAppAttemptState.ALLOCATED_SAVING, 
++          RMAppAttemptState.ALLOCATED,
++          RMAppAttemptEventType.ATTEMPT_SAVED, new AttemptLaunchTransition())
++      .addTransition(RMAppAttemptState.ALLOCATED_SAVING, 
++          RMAppAttemptState.ALLOCATED_SAVING,
++          RMAppAttemptEventType.CONTAINER_ACQUIRED, 
++          new ContainerAcquiredTransition())
++      .addTransition(RMAppAttemptState.ALLOCATED_SAVING, 
++          RMAppAttemptState.KILLED,
++          RMAppAttemptEventType.KILL,
++          new BaseFinalTransition(RMAppAttemptState.KILLED))
+ 
+        // Transitions from ALLOCATED State
+       .addTransition(RMAppAttemptState.ALLOCATED,
+@@ -278,6 +297,7 @@
+               RMAppAttemptEventType.EXPIRE,
+               RMAppAttemptEventType.REGISTERED,
+               RMAppAttemptEventType.CONTAINER_ALLOCATED,
++              RMAppAttemptEventType.ATTEMPT_SAVED,
+               RMAppAttemptEventType.CONTAINER_FINISHED,
+               RMAppAttemptEventType.UNREGISTERED,
+               RMAppAttemptEventType.KILL,
+@@ -317,7 +337,7 @@ public ApplicationAttemptId getAppAttemptId() {
+   @Override
+   public ApplicationSubmissionContext getSubmissionContext() {
+     return this.submissionContext;
+-  }
++  } 
+ 
+   @Override
+   public FinalApplicationStatus getFinalApplicationStatus() {
+@@ -560,6 +580,19 @@ public ApplicationResourceUsageReport getApplicationResourceUsageReport() {
+     }
+   }
+ 
++  @Override
++  public void recover(RMState state) {
++    ApplicationState appState = 
++        state.getApplicationState().get(getAppAttemptId().getApplicationId());
++    ApplicationAttemptState attemptState = appState.getAttempt(getAppAttemptId());
++    masterContainer = attemptState.getMasterContainer();
++    LOG.info("Recovered attempt: AppId: " + getAppAttemptId().getApplicationId() 
++             + " AttemptId: " + getAppAttemptId()
++             + " MasterContainer: " + masterContainer);
++    // TODO other data
++    // TODO transition attempt state to killed/failed and set status
++  }
++  
+   private static class BaseTransition implements
+       SingleArcTransition<RMAppAttemptImpl, RMAppAttemptEvent> {
+ 
+@@ -655,9 +688,10 @@ public RMAppAttemptState transition(RMAppAttemptImpl appAttempt,
+     }
+   }
+ 
+-  private static final class AMContainerAllocatedTransition extends BaseTransition {
++  private static final class AMContainerAllocatedTransition implements 
++    MultipleArcTransition<RMAppAttemptImpl, RMAppAttemptEvent, RMAppAttemptState> {
+     @Override
+-    public void transition(RMAppAttemptImpl appAttempt,
++    public RMAppAttemptState transition(RMAppAttemptImpl appAttempt,
+         RMAppAttemptEvent event) {
+ 
+       // Acquire the AM container from the scheduler.
+@@ -669,9 +703,30 @@ public void transition(RMAppAttemptImpl appAttempt,
+       appAttempt.masterContainer = amContainerAllocation.getContainers().get(
+           0);
+ 
+-      // Send event to launch the AM Container
+-      appAttempt.eventHandler.handle(new AMLauncherEvent(
+-          AMLauncherEventType.LAUNCH, appAttempt));
++      RMStateStore store = appAttempt.rmContext.getStateStore();
++      if(store != null) {
++        // recovery is enabled
++        // store attempt data in a non-blocking manner to prevent dispatcher
++        // thread starvation and wait for state to be saved
++        LOG.info("Storing attempt: AppId: " + 
++                  appAttempt.getAppAttemptId().getApplicationId() 
++                  + " AttemptId: " + 
++                  appAttempt.getAppAttemptId()
++                  + " MasterContainer: " + appAttempt.masterContainer);
++        store.storeApplicationAttempt(appAttempt);
++        return RMAppAttemptState.ALLOCATED_SAVING;
++      } else {
++        appAttempt.launchAttempt();
++        return RMAppAttemptState.ALLOCATED;
++      }
++    }
++  }
++  
++  private static final class AttemptLaunchTransition extends BaseTransition {
++    @Override
++    public void transition(RMAppAttemptImpl appAttempt,
++        RMAppAttemptEvent event) {
++      appAttempt.launchAttempt();
+     }
+   }
+ 
+@@ -1039,4 +1094,9 @@ public long getStartTime() {
+       this.readLock.unlock();
+     }
+   }
++  
++  private void launchAttempt(){
++    // Send event to launch the AM Container
++    eventHandler.handle(new AMLauncherEvent(AMLauncherEventType.LAUNCH, this));
++  }
+ }
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptState.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptState.java
+index b3eaa02..9a1390c 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptState.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/RMAppAttemptState.java
+@@ -19,6 +19,6 @@
+ package org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt;
+ 
+ public enum RMAppAttemptState {
+-  NEW, SUBMITTED, SCHEDULED, ALLOCATED, LAUNCHED, FAILED, RUNNING,
+-  FINISHING, FINISHED, KILLED,
++  NEW, SUBMITTED, SCHEDULED, ALLOCATED, ALLOCATED_SAVING, LAUNCHED, FAILED, 
++  RUNNING, FINISHING, FINISHED, KILLED,
+ }
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java
+index 7c44748..452cb9b 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java
+@@ -36,7 +36,6 @@
+ import org.apache.hadoop.yarn.api.records.Priority;
+ import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.api.records.ResourceRequest;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+@@ -70,14 +69,12 @@
+   boolean pending = true; // for app metrics
+ 
+   public AppSchedulingInfo(ApplicationAttemptId appAttemptId,
+-      String user, Queue queue, ActiveUsersManager activeUsersManager,
+-      ApplicationStore store) {
++      String user, Queue queue, ActiveUsersManager activeUsersManager) {
+     this.applicationAttemptId = appAttemptId;
+     this.applicationId = appAttemptId.getApplicationId();
+     this.queue = queue;
+     this.queueName = queue.getQueueName();
+     this.user = user;
+-    //this.store = store;
+     this.activeUsersManager = activeUsersManager;
+   }
+ 
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+index 4534b27..2bac243 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+@@ -49,7 +49,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEventType;
+@@ -365,7 +365,7 @@ synchronized CSQueue getQueue(String queueName) {
+     // TODO: Fix store
+     FiCaSchedulerApp SchedulerApp = 
+         new FiCaSchedulerApp(applicationAttemptId, user, queue, 
+-            queue.getActiveUsersManager(), rmContext, null);
++            queue.getActiveUsersManager(), rmContext);
+ 
+     // Submit to the queue
+     try {
+@@ -767,18 +767,7 @@ private RMContainer getRMContainer(ContainerId containerId) {
+   @Override
+   @Lock(Lock.NoLock.class)
+   public void recover(RMState state) throws Exception {
+-    // TODO: VINDOKVFIXME recovery
+-//    applications.clear();
+-//    for (Map.Entry<ApplicationId, ApplicationInfo> entry : state.getStoredApplications().entrySet()) {
+-//      ApplicationId appId = entry.getKey();
+-//      ApplicationInfo appInfo = entry.getValue();
+-//      SchedulerApp app = applications.get(appId);
+-//      app.allocate(appInfo.getContainers());
+-//      for (Container c: entry.getValue().getContainers()) {
+-//        Queue queue = queues.get(appInfo.getApplicationSubmissionContext().getQueue());
+-//        queue.recoverContainer(clusterResource, applications.get(appId), c);
+-//      }
+-//    }
++    // NOT IMPLEMENTED
+   }
+ 
+   @Override
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+index e183a2d..42633dc 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+@@ -1429,6 +1429,9 @@ public synchronized void updateClusterResource(Resource clusterResource) {
+         CSQueueUtils.computeMaxActiveApplicationsPerUser(
+             maxActiveAppsUsingAbsCap, userLimit, userLimitFactor);
+     
++    // TODO Possible bug fix
++    activateApplications();
++    
+     // Update metrics
+     CSQueueUtils.updateQueueStatistics(
+         this, getParent(), clusterResource, minimumAllocation);
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java
+index e53ca82..317f2a2 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java
+@@ -43,7 +43,6 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
+@@ -111,11 +110,11 @@
+   private final RMContext rmContext;
+   public FiCaSchedulerApp(ApplicationAttemptId applicationAttemptId, 
+       String user, Queue queue, ActiveUsersManager activeUsersManager,
+-      RMContext rmContext, ApplicationStore store) {
++      RMContext rmContext) {
+     this.rmContext = rmContext;
+     this.appSchedulingInfo = 
+         new AppSchedulingInfo(applicationAttemptId, user, queue,  
+-            activeUsersManager, store);
++            activeUsersManager);
+     this.queue = queue;
+   }
+ 
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerApp.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerApp.java
+index e2a385f..e074961 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerApp.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FSSchedulerApp.java
+@@ -42,7 +42,6 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
+@@ -103,11 +102,11 @@
+   private final RMContext rmContext;
+   public FSSchedulerApp(ApplicationAttemptId applicationAttemptId, 
+       String user, Queue queue, ActiveUsersManager activeUsersManager,
+-      RMContext rmContext, ApplicationStore store) {
++      RMContext rmContext) {
+     this.rmContext = rmContext;
+     this.appSchedulingInfo = 
+         new AppSchedulingInfo(applicationAttemptId, user, queue,  
+-            activeUsersManager, store);
++            activeUsersManager);
+     this.queue = queue;
+   }
+ 
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+index 1d2412e..8f870a8 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+@@ -50,7 +50,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEventType;
+@@ -483,7 +483,7 @@ public FairSchedulerEventLog getEventLog() {
+     FSSchedulerApp schedulerApp =
+         new FSSchedulerApp(applicationAttemptId, user,
+             queue.getQueueSchedulable(), new ActiveUsersManager(this.getRootQueueMetrics()),
+-            rmContext, null);
++            rmContext);
+ 
+     // Inforce ACLs
+     UserGroupInformation userUgi;
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+index a69374c..01b85b2 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+@@ -56,7 +56,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEventType;
+@@ -292,7 +292,7 @@ private synchronized void addApplication(ApplicationAttemptId appAttemptId,
+     // TODO: Fix store
+     FiCaSchedulerApp schedulerApp = 
+         new FiCaSchedulerApp(appAttemptId, user, DEFAULT_QUEUE, activeUsersManager,
+-            this.rmContext, null);
++            this.rmContext);
+     applications.put(appAttemptId, schedulerApp);
+     metrics.submitApp(user, appAttemptId.getAttemptId());
+     LOG.info("Application Submission: " + appAttemptId.getApplicationId() + 
+@@ -763,13 +763,7 @@ private synchronized void addNode(RMNode nodeManager) {
+ 
+   @Override
+   public void recover(RMState state) {
+-    // TODO fix recovery
+-//    for (Map.Entry<ApplicationId, ApplicationInfo> entry: state.getStoredApplications().entrySet()) {
+-//      ApplicationId appId = entry.getKey();
+-//      ApplicationInfo appInfo = entry.getValue();
+-//      SchedulerApp app = applications.get(appId);
+-//      app.allocate(appInfo.getContainers());
+-//    }
++    // NOT IMPLEMENTED
+   }
+ 
+   @Override
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockAM.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockAM.java
+index b097ea3..ace5efb 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockAM.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockAM.java
+@@ -47,7 +47,7 @@
+   private volatile int responseId = 0;
+   private final ApplicationAttemptId attemptId;
+   private final RMContext context;
+-  private final AMRMProtocol amRMProtocol;
++  private AMRMProtocol amRMProtocol;
+ 
+   private final List<ResourceRequest> requests = new ArrayList<ResourceRequest>();
+   private final List<ContainerId> releases = new ArrayList<ContainerId>();
+@@ -58,6 +58,10 @@
+     this.amRMProtocol = amRMProtocol;
+     this.attemptId = attemptId;
+   }
++  
++  void setAMRMProtocol(AMRMProtocol amRMProtocol) {
++    this.amRMProtocol = amRMProtocol;
++  }
+ 
+   public void waitForState(RMAppAttemptState finalState) throws Exception {
+     RMApp app = context.getRMApps().get(attemptId.getApplicationId());
+@@ -66,7 +70,8 @@ public void waitForState(RMAppAttemptState finalState) throws Exception {
+     while (!finalState.equals(attempt.getAppAttemptState())
+         && timeoutSecs++ < 20) {
+       System.out
+-          .println("AppAttempt State is : " + attempt.getAppAttemptState()
++          .println("AppAttempt : " + attemptId + " State is : " 
++              + attempt.getAppAttemptState()
+               + " Waiting for state : " + finalState);
+       Thread.sleep(500);
+     }
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockNM.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockNM.java
+index ba999bf..8f66bdb 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockNM.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockNM.java
+@@ -46,7 +46,7 @@
+   private int responseId;
+   private NodeId nodeId;
+   private final int memory;
+-  private final ResourceTrackerService resourceTracker;
++  private ResourceTrackerService resourceTracker;
+   private final int httpPort = 2;
+   private MasterKey currentMasterKey;
+ 
+@@ -66,6 +66,10 @@ public NodeId getNodeId() {
+   public int getHttpPort() {
+     return httpPort;
+   }
++  
++  void setResourceTrackerService(ResourceTrackerService resourceTracker) {
++    this.resourceTracker = resourceTracker;
++  }
+ 
+   public void containerStatus(Container container) throws Exception {
+     Map<ApplicationId, List<ContainerStatus>> conts = 
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
+index 11bf85d..6642aa7 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
+@@ -39,9 +39,11 @@
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.ApplicationMasterLauncher;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppState;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
+@@ -63,19 +65,24 @@ public MockRM() {
+   }
+ 
+   public MockRM(Configuration conf) {
+-    super(StoreFactory.getStore(conf));    
++    this(conf, false, StoreFactory.getStore(conf));    
++  }
++  
++  public MockRM(Configuration conf, boolean recoveryEnabled, RMStateStore store) {
++    super(recoveryEnabled, store);    
+     init(conf instanceof YarnConfiguration ? conf : new YarnConfiguration(conf));
+     Logger rootLogger = LogManager.getRootLogger();
+-    rootLogger.setLevel(Level.DEBUG);
++    rootLogger.setLevel(Level.DEBUG);    
+   }
+ 
++  // TODO timeout increased to workaround long host resolution delays
+   public void waitForState(ApplicationId appId, RMAppState finalState)
+       throws Exception {
+     RMApp app = getRMContext().getRMApps().get(appId);
+     Assert.assertNotNull("app shouldn't be null", app);
+     int timeoutSecs = 0;
+-    while (!finalState.equals(app.getState()) && timeoutSecs++ < 20) {
+-      System.out.println("App State is : " + app.getState()
++    while (!finalState.equals(app.getState()) && timeoutSecs++ < 200) {
++      System.out.println("App : " + appId + " State is : " + app.getState()
+           + " Waiting for state : " + finalState);
+       Thread.sleep(500);
+     }
+@@ -83,6 +90,24 @@ public void waitForState(ApplicationId appId, RMAppState finalState)
+     Assert.assertEquals("App state is not correct (timedout)", finalState,
+         app.getState());
+   }
++  
++  public void waitForState(ApplicationAttemptId attemptId, 
++                           RMAppAttemptState finalState)
++      throws Exception {
++    RMApp app = getRMContext().getRMApps().get(attemptId.getApplicationId());
++    Assert.assertNotNull("app shouldn't be null", app);
++    RMAppAttempt attempt = app.getCurrentAppAttempt();
++    int timeoutSecs = 0;
++    while (!finalState.equals(attempt.getAppAttemptState()) && timeoutSecs++ < 200) {
++      System.out.println("AppAttempt : " + attemptId 
++          + " State is : " + attempt.getAppAttemptState()
++          + " Waiting for state : " + finalState);
++      Thread.sleep(500);
++    }
++    System.out.println("Attempt State is : " + attempt.getAppAttemptState());
++    Assert.assertEquals("Attempt state is not correct (timedout)", finalState,
++        attempt.getAppAttemptState());
++  }
+ 
+   // get new application id
+   public GetNewApplicationResponse getNewAppId() throws Exception {
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestAppManager.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestAppManager.java
+index 3e83e0b..b85d482 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestAppManager.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestAppManager.java
+@@ -37,7 +37,6 @@
+ import org.apache.hadoop.yarn.event.EventHandler;
+ import org.apache.hadoop.yarn.factories.RecordFactory;
+ import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.MockRMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
+@@ -93,7 +92,7 @@ public static RMContext mockRMContext(int n, long time) {
+         rmDispatcher);
+     AMLivelinessMonitor amFinishingMonitor = new AMLivelinessMonitor(
+         rmDispatcher);
+-    return new RMContextImpl(new MemStore(), rmDispatcher,
++    return new RMContextImpl(rmDispatcher,
+         containerAllocationExpirer, amLivelinessMonitor, amFinishingMonitor,
+         null, null, null, null) {
+       @Override
+@@ -366,7 +365,6 @@ public void testRMAppSubmit() throws Exception {
+         YarnConfiguration.DEFAULT_QUEUE_NAME, 
+         app.getQueue());
+     Assert.assertEquals("app state doesn't match", RMAppState.NEW, app.getState());
+-    Assert.assertNotNull("app store is null", app.getApplicationStore());
+ 
+     // wait for event to be processed
+     int timeoutSecs = 0;
+@@ -413,7 +411,6 @@ public void testRMAppSubmitWithQueueAndName() throws Exception {
+     Assert.assertEquals("app name doesn't match", "testApp1", app.getName());
+     Assert.assertEquals("app queue doesn't match", "testQueue", app.getQueue());
+     Assert.assertEquals("app state doesn't match", RMAppState.NEW, app.getState());
+-    Assert.assertNotNull("app store is null", app.getApplicationStore());
+ 
+     // wait for event to be processed
+     int timeoutSecs = 0;
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestApplicationACLs.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestApplicationACLs.java
+index cc251e1..e0852c3 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestApplicationACLs.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestApplicationACLs.java
+@@ -50,7 +50,7 @@
+ import org.apache.hadoop.yarn.factories.RecordFactory;
+ import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
+ import org.apache.hadoop.yarn.ipc.YarnRPC;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppState;
+ import org.apache.hadoop.yarn.service.Service.STATE;
+@@ -85,7 +85,7 @@
+ 
+   @BeforeClass
+   public static void setup() throws InterruptedException, IOException {
+-    Store store = StoreFactory.getStore(conf);
++    RMStateStore store = StoreFactory.getStore(conf);
+     conf.setBoolean(YarnConfiguration.YARN_ACL_ENABLE, true);
+     AccessControlList adminACL = new AccessControlList("");
+     adminACL.addGroup(SUPER_GROUP);
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestClientRMService.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestClientRMService.java
+index 555c822..f7f2a0d 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestClientRMService.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestClientRMService.java
+@@ -182,7 +182,7 @@ private ApplicationId getApplicationId(int id) {
+   private RMAppImpl getRMApp(RMContext rmContext, YarnScheduler yarnScheduler,
+       ApplicationId applicationId3, YarnConfiguration config, String queueName) {
+     return new RMAppImpl(applicationId3, rmContext, config, null, null,
+-        queueName, null, null, null, yarnScheduler, null, System
++        queueName, null, null, yarnScheduler, null, System
+             .currentTimeMillis());
+   }
+ }
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMNodeTransitions.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMNodeTransitions.java
+index 6f6d565..9ae8bf0 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMNodeTransitions.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMNodeTransitions.java
+@@ -36,7 +36,6 @@
+ import org.apache.hadoop.yarn.api.records.NodeState;
+ import org.apache.hadoop.yarn.event.EventHandler;
+ import org.apache.hadoop.yarn.server.api.records.HeartbeatResponse;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.resourcetracker.InlineDispatcher;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeCleanContainerEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeEvent;
+@@ -79,7 +78,7 @@ public void setUp() throws Exception {
+     InlineDispatcher rmDispatcher = new InlineDispatcher();
+     
+     rmContext =
+-        new RMContextImpl(new MemStore(), rmDispatcher, null, null, null,
++        new RMContextImpl(rmDispatcher, null, null, null,
+             mock(DelegationTokenRenewer.class), null, null, null);
+     scheduler = mock(YarnScheduler.class);
+     doAnswer(
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
+new file mode 100644
+index 0000000..f714933
+--- /dev/null
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
+@@ -0,0 +1,311 @@
++package org.apache.hadoop.yarn.server.resourcemanager;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.yarn.api.records.AMResponse;
++import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
++import org.apache.hadoop.yarn.api.records.ApplicationId;
++import org.apache.hadoop.yarn.api.records.Container;
++import org.apache.hadoop.yarn.api.records.ContainerId;
++import org.apache.hadoop.yarn.api.records.ContainerState;
++import org.apache.hadoop.yarn.api.records.ResourceRequest;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
++import org.apache.hadoop.yarn.server.api.records.HeartbeatResponse;
++import org.apache.hadoop.yarn.server.api.records.NodeAction;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemoryRMStateStore;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.ApplicationAttemptState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.ApplicationState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppState;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
++import org.apache.hadoop.yarn.util.BuilderUtils;
++import org.apache.log4j.Level;
++import org.apache.log4j.LogManager;
++import org.apache.log4j.Logger;
++import org.junit.Assert;
++import org.junit.Test;
++
++public class TestRMRestart {
++
++  private static final Log LOG = LogFactory.getLog(TestRMRestart.class);
++  
++  @Test
++  public void testRMRestart() throws Exception {
++    Logger rootLogger = LogManager.getRootLogger();
++    rootLogger.setLevel(Level.DEBUG);
++    MemoryRMStateStore memStore = new MemoryRMStateStore();
++    RMState rmState = memStore.loadState();
++    Map<ApplicationId, ApplicationState> rmAppState = 
++                                                  rmState.getApplicationState();
++    
++    YarnConfiguration conf = new YarnConfiguration();
++    
++    MockRM rm1 = new MockRM(conf, true, memStore) {
++      @Override
++      protected void doSecureLogin() throws IOException {
++        // Skip the login.
++      }
++    };
++    
++    // start like normal because state is empty
++    rm1.start();
++    MockNM nm1 = new MockNM("h1:1234", 15120, rm1.getResourceTrackerService());
++    MockNM nm2 = new MockNM("h2:5678", 15120, rm1.getResourceTrackerService());
++    nm1.registerNode();
++    nm2.registerNode();
++    
++    // app that gets launched
++    RMApp app1 = rm1.submitApp(200);
++    
++    // assert app1 info is saved
++    ApplicationState appState = rmAppState.get(app1.getApplicationId());
++    Assert.assertNotNull(appState);
++    Assert.assertEquals(0, appState.getAttemptCount());
++    Assert.assertEquals(appState.getApplicationSubmissionContext(), 
++                        app1.getApplicationSubmissionContext());
++    
++
++    //kick the scheduling
++    nm1.nodeHeartbeat(true);
++    nm2.nodeHeartbeat(true);
++    
++    // assert app1 attempt is saved
++    RMAppAttempt attempt1 = app1.getCurrentAppAttempt();
++    ApplicationAttemptId attemptId1 = attempt1.getAppAttemptId();
++    rm1.waitForState(attemptId1, RMAppAttemptState.ALLOCATED);
++    Assert.assertEquals(1, appState.getAttemptCount());
++    ApplicationAttemptState attemptState = 
++                                appState.getAttempt(attemptId1);
++    Assert.assertNotNull(attemptState);
++    Assert.assertEquals(BuilderUtils.newContainerId(attemptId1, 1), 
++                        attemptState.getMasterContainer().getId());
++    
++
++    MockAM am1 = rm1.sendAMLaunched(attempt1.getAppAttemptId());
++    am1.registerAppAttempt();
++
++    //request for containers
++    am1.allocate("h1" , 1000, 3, new ArrayList<ContainerId>());
++    
++    // kick the scheduler - XXX remove this part
++    nm1.nodeHeartbeat(true);
++    List<Container> conts = am1.allocate(new ArrayList<ResourceRequest>(),
++        new ArrayList<ContainerId>()).getAllocatedContainers();
++    int contReceived = conts.size();
++    while (contReceived < 3) {//only 3 containers are available on node1
++      conts.addAll(am1.allocate(new ArrayList<ResourceRequest>(),
++          new ArrayList<ContainerId>()).getAllocatedContainers());
++      // TODO this is wrong. Should be += 
++      contReceived = conts.size();
++      LOG.info("Got " + contReceived + " containers. Waiting to get " + 3);
++      Thread.sleep(2000);
++    }
++    Assert.assertEquals(3, conts.size());
++    
++    // app that does not get launched
++    RMApp app2 = rm1.submitApp(200);
++
++    // assert app2 info is saved
++    appState = rmAppState.get(app2.getApplicationId());
++    Assert.assertNotNull(appState);
++    Assert.assertEquals(0, appState.getAttemptCount());
++    Assert.assertEquals(appState.getApplicationSubmissionContext(), 
++                        app2.getApplicationSubmissionContext());
++    
++    // create new RM
++    MockRM rm2 = new MockRM(conf, true, memStore) {
++      @Override
++      protected void doSecureLogin() throws IOException {
++        // Skip the login.
++      }
++    };
++    
++    // recover state
++    rmState = memStore.loadState();
++    rmAppState = rmState.getApplicationState();
++    rm2.recover(rmState);
++    
++    nm1.setResourceTrackerService(rm2.getResourceTrackerService());
++    nm2.setResourceTrackerService(rm2.getResourceTrackerService());
++
++    // start with load of old state
++    RMApp loadedApp1 = rm2.getRMContext().getRMApps().get(app1.getApplicationId());
++    Assert.assertNotNull(loadedApp1);
++    Assert.assertEquals(1, loadedApp1.getAppAttempts().size());
++    Assert.assertEquals(app1.getApplicationSubmissionContext(), 
++                        loadedApp1.getApplicationSubmissionContext());
++    RMApp loadedApp2 = rm2.getRMContext().getRMApps().get(app2.getApplicationId());
++    Assert.assertNotNull(loadedApp2);
++    Assert.assertEquals(0, loadedApp2.getAppAttempts().size());
++    Assert.assertEquals(app2.getApplicationSubmissionContext(), 
++                        loadedApp2.getApplicationSubmissionContext());
++    
++    rm2.start();
++    
++    rm2.waitForState(loadedApp1.getApplicationId(), RMAppState.ACCEPTED);
++    rm2.waitForState(loadedApp2.getApplicationId(), RMAppState.ACCEPTED);
++    
++    // starting should create new attempts
++    Assert.assertEquals(2, loadedApp1.getAppAttempts().size());
++    Assert.assertEquals(1, loadedApp2.getAppAttempts().size());
++    
++    // TODO add AM register exception here
++    
++    // NM should be rebooted on heartbeat, even first heartbeat for nm2
++    HeartbeatResponse hbResponse = nm1.nodeHeartbeat(true);
++    Assert.assertEquals(NodeAction.REBOOT, hbResponse.getNodeAction());
++    hbResponse = nm2.nodeHeartbeat(true);
++    Assert.assertEquals(NodeAction.REBOOT, hbResponse.getNodeAction());
++    
++    nm1 = rm2.registerNode("h1:1234", 15120);
++    nm2 = rm2.registerNode("h2:5678", 15120);
++
++    hbResponse = nm1.nodeHeartbeat(true);
++    Assert.assertTrue(NodeAction.REBOOT != hbResponse.getNodeAction());
++    hbResponse = nm2.nodeHeartbeat(true);
++    Assert.assertTrue(NodeAction.REBOOT != hbResponse.getNodeAction());
++    
++    // TODO test for AM register and finish 
++    // old AM should get reboot
++    am1.setAMRMProtocol(rm2.getApplicationMasterService());
++    AMResponse amResponse = am1.allocate(new ArrayList<ResourceRequest>(),
++        new ArrayList<ContainerId>());
++    Assert.assertTrue(amResponse.getReboot());
++    
++    nm1.nodeHeartbeat(true);
++    nm2.nodeHeartbeat(true);
++    
++    // assert app1 attempt is saved
++    attempt1 = loadedApp1.getCurrentAppAttempt();
++    attemptId1 = attempt1.getAppAttemptId();
++    rm2.waitForState(attemptId1, RMAppAttemptState.ALLOCATED);
++    appState = rmAppState.get(loadedApp1.getApplicationId());
++    attemptState = appState.getAttempt(attemptId1);
++    Assert.assertNotNull(attemptState);
++    Assert.assertEquals(BuilderUtils.newContainerId(attemptId1, 1), 
++                        attemptState.getMasterContainer().getId());
++
++    nm1.nodeHeartbeat(true);
++    nm2.nodeHeartbeat(true);
++
++    // assert app1 attempt is saved
++    RMAppAttempt attempt2 = loadedApp2.getCurrentAppAttempt();
++    ApplicationAttemptId attemptId2 = attempt2.getAppAttemptId();
++    rm2.waitForState(attemptId2, RMAppAttemptState.ALLOCATED);
++    appState = rmAppState.get(loadedApp2.getApplicationId());
++    attemptState = appState.getAttempt(attemptId2);
++    Assert.assertNotNull(attemptState);
++    Assert.assertEquals(BuilderUtils.newContainerId(attemptId2, 1), 
++                        attemptState.getMasterContainer().getId());
++
++    am1 = rm2.sendAMLaunched(attempt1.getAppAttemptId());
++    am1.registerAppAttempt();
++    
++    MockAM am2 = rm2.sendAMLaunched(attempt2.getAppAttemptId());
++    am2.registerAppAttempt();
++
++    //request for containers
++    am1.allocate("h1" , 1000, 3, new ArrayList<ContainerId>());
++    
++    // kick the scheduler - XXX remove this part
++    nm1.nodeHeartbeat(true);
++    nm2.nodeHeartbeat(true);
++    conts = am1.allocate(new ArrayList<ResourceRequest>(),
++        new ArrayList<ContainerId>()).getAllocatedContainers();
++    contReceived = conts.size();
++    while (contReceived < 3) {//only 3 containers are available on node1
++      conts.addAll(am1.allocate(new ArrayList<ResourceRequest>(),
++          new ArrayList<ContainerId>()).getAllocatedContainers());
++      contReceived = conts.size();
++      LOG.info("Got " + contReceived + " containers. Waiting to get " + 3);
++      Thread.sleep(2000);
++    }
++    Assert.assertEquals(3, conts.size());
++        
++    am1.unregisterAppAttempt();
++    nm1.nodeHeartbeat(attempt1.getAppAttemptId(), 1, ContainerState.COMPLETE);
++    am1.waitForState(RMAppAttemptState.FINISHED);
++    
++    am2.unregisterAppAttempt();
++    nm1.nodeHeartbeat(attempt2.getAppAttemptId(), 1, ContainerState.COMPLETE);
++    am2.waitForState(RMAppAttemptState.FINISHED);
++
++    rm2.stop();
++    rm1.stop();
++ }
++  
++    //@Test
++    public void testCapacitySchedulerBug() throws Exception {
++      Logger rootLogger = LogManager.getRootLogger();
++      rootLogger.setLevel(Level.DEBUG);
++      YarnConfiguration conf = new YarnConfiguration();
++      
++      MockRM rm1 = new MockRM(conf) {
++        @Override
++        protected void doSecureLogin() throws IOException {
++          // Skip the login.
++        }
++      };
++      
++      // start like normal because state is empty
++      rm1.start();
++  
++      // app that gets launched
++      RMApp app1 = rm1.submitApp(200);
++      
++      // app that does not get launched
++      RMApp app2 = rm1.submitApp(200);
++      
++      MockNM nm1 = new MockNM("h1:1234", 15120, rm1.getResourceTrackerService());
++      MockNM nm2 = new MockNM("h2:5678", 15120, rm1.getResourceTrackerService());
++      nm1.registerNode();
++      nm2.registerNode();
++      
++      //kick the scheduling
++      nm1.nodeHeartbeat(true);
++      nm2.nodeHeartbeat(true);
++      
++      // assert app1 attempt is saved
++      RMAppAttempt attempt1 = app1.getCurrentAppAttempt();
++      ApplicationAttemptId attemptId1 = attempt1.getAppAttemptId();
++      rm1.waitForState(attemptId1, RMAppAttemptState.ALLOCATED);
++      RMAppAttempt attempt2 = app2.getCurrentAppAttempt();
++      ApplicationAttemptId attemptId2 = attempt2.getAppAttemptId();
++      rm1.waitForState(attemptId2, RMAppAttemptState.ALLOCATED);    
++  
++      MockAM am1 = rm1.sendAMLaunched(attempt1.getAppAttemptId());
++      am1.registerAppAttempt();
++      
++      //request for containers
++      am1.allocate("h1" , 1000, 3, new ArrayList<ContainerId>());
++      
++      // kick the scheduler - XXX remove this part
++      nm1.nodeHeartbeat(true);
++      List<Container> conts = am1.allocate(new ArrayList<ResourceRequest>(),
++          new ArrayList<ContainerId>()).getAllocatedContainers();
++      int contReceived = conts.size();
++      while (contReceived < 3) {//only 3 containers are available on node1
++        conts.addAll(am1.allocate(new ArrayList<ResourceRequest>(),
++            new ArrayList<ContainerId>()).getAllocatedContainers());
++        // TODO this is wrong. Should be += 
++        contReceived = conts.size();
++        LOG.info("Got " + contReceived + " containers. Waiting to get " + 3);
++        Thread.sleep(2000);
++      }
++      Assert.assertEquals(3, conts.size());
++      
++      am1.unregisterAppAttempt();
++      nm1.nodeHeartbeat(attempt1.getAppAttemptId(), 1, ContainerState.COMPLETE);
++      am1.waitForState(RMAppAttemptState.FINISHED);
++      
++      rm1.stop();
++    }
++
++}
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestResourceManager.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestResourceManager.java
+index ce64065..501d7aa 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestResourceManager.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestResourceManager.java
+@@ -31,7 +31,7 @@
+ import org.apache.hadoop.yarn.api.records.Priority;
+ import org.apache.hadoop.yarn.api.records.Resource;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+@@ -47,8 +47,8 @@
+   @Before
+   public void setUp() throws Exception {
+     Configuration conf = new YarnConfiguration();
+-    Store store = StoreFactory.getStore(conf);
+-    resourceManager = new ResourceManager(store);
++    RMStateStore store = StoreFactory.getStore(conf);
++    resourceManager = new ResourceManager(false, store);
+     resourceManager.init(conf);
+   }
+ 
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/MockAsm.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/MockAsm.java
+index 81aba39..088eca9 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/MockAsm.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/MockAsm.java
+@@ -28,11 +28,11 @@
+ import org.apache.hadoop.yarn.api.records.ApplicationMaster;
+ import org.apache.hadoop.yarn.api.records.ApplicationReport;
+ import org.apache.hadoop.yarn.api.records.ApplicationStatus;
++import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+ import org.apache.hadoop.yarn.api.records.Container;
+ import org.apache.hadoop.yarn.api.records.ContainerId;
+ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
+ import org.apache.hadoop.yarn.api.records.YarnApplicationState;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppState;
+@@ -154,6 +154,11 @@ public String getUser() {
+     }
+ 
+     @Override
++    public ApplicationSubmissionContext getApplicationSubmissionContext() {
++      throw new UnsupportedOperationException("Not supported yet.");
++    }
++    
++    @Override
+     public String getName() {
+       throw new UnsupportedOperationException("Not supported yet.");
+     }
+@@ -194,10 +199,6 @@ public RMAppAttempt getCurrentAppAttempt() {
+       throw new UnsupportedOperationException("Not supported yet.");
+     }
+     @Override
+-    public ApplicationStore getApplicationStore() {
+-      throw new UnsupportedOperationException("Not supported yet.");
+-    }
+-    @Override
+     public float getProgress() {
+       throw new UnsupportedOperationException("Not supported yet.");
+     }
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMLaunchFailure.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMLaunchFailure.java
+index 05ae726..130f0e4 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMLaunchFailure.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMLaunchFailure.java
+@@ -49,8 +49,6 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEventType;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.Allocation;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.YarnScheduler;
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+index 03d394a..211eaa5 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+@@ -53,9 +53,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEventType;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.Allocation;
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestASMStateMachine.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestASMStateMachine.java
+index 219a28f..f866694 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestASMStateMachine.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestASMStateMachine.java
+@@ -35,7 +35,6 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEventType;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.AMLivelinessMonitor;
+ import org.junit.After;
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestApplicationMasterExpiry.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestApplicationMasterExpiry.java
+index 00ab954..8a3f0a2 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestApplicationMasterExpiry.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestApplicationMasterExpiry.java
+@@ -36,8 +36,6 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEventType;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.AMLivelinessMonitor;
+ import org.junit.Before;
+ import org.junit.Test;
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestSchedulerNegotiator.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestSchedulerNegotiator.java
+index f495ada..296ca73 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestSchedulerNegotiator.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestSchedulerNegotiator.java
+@@ -43,9 +43,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEventType;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.AMLivelinessMonitor;
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestNMExpiry.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestNMExpiry.java
+index bec07af..1c4b6f9 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestNMExpiry.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestNMExpiry.java
+@@ -39,7 +39,6 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager.NodeEventDispatcher;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceTrackerService;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.SchedulerEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.security.RMContainerTokenSecretManager;
+@@ -70,7 +69,7 @@ public void setUp() {
+     Configuration conf = new Configuration();
+     // Dispatcher that processes events inline
+     Dispatcher dispatcher = new InlineDispatcher();
+-    RMContext context = new RMContextImpl(new MemStore(), dispatcher, null,
++    RMContext context = new RMContextImpl(dispatcher, null,
+         null, null, null, null, null, null);
+     dispatcher.register(SchedulerEventType.class,
+         new InlineDispatcher.EmptyEventHandler());
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestRMNMRPCResponseId.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestRMNMRPCResponseId.java
+index 629e888..a7a52c2 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestRMNMRPCResponseId.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/resourcetracker/TestRMNMRPCResponseId.java
+@@ -39,7 +39,6 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceTrackerService;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.SchedulerEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.security.RMContainerTokenSecretManager;
+@@ -66,7 +65,7 @@ public void handle(Event event) {
+       }
+     });
+     RMContext context =
+-        new RMContextImpl(new MemStore(), dispatcher, null, null, null, null,
++        new RMContextImpl(dispatcher, null, null, null, null,
+           null, null, null);
+     dispatcher.register(RMNodeEventType.class,
+         new ResourceManager.NodeEventDispatcher(context));
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/MockRMApp.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/MockRMApp.java
+index e5ea2b8..516fca6 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/MockRMApp.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/MockRMApp.java
+@@ -24,11 +24,11 @@
+ import java.util.Map;
+ 
+ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
++import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.ApplicationReport;
+ import org.apache.hadoop.yarn.MockApps;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+ 
+@@ -68,6 +68,11 @@ public MockRMApp(int newid, long time, RMAppState newState, String userName, Str
+   public ApplicationId getApplicationId() {
+     return id;
+   }
++  
++  @Override
++  public ApplicationSubmissionContext getApplicationSubmissionContext() {
++    throw new UnsupportedOperationException("Not supported yet.");
++  }
+ 
+   @Override
+   public RMAppState getState() {
+@@ -138,11 +143,6 @@ public ApplicationReport createAndGetApplicationReport(boolean allowAccess) {
+   }
+ 
+   @Override
+-  public ApplicationStore getApplicationStore() {
+-    throw new UnsupportedOperationException("Not supported yet.");
+-  }
+-
+-  @Override
+   public long getFinishTime() {
+     return finish;
+   }
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/TestRMAppTransitions.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/TestRMAppTransitions.java
+index 4546946..0f20cb3 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/TestRMAppTransitions.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/TestRMAppTransitions.java
+@@ -40,8 +40,6 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMAppManagerEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.ApplicationsStore.ApplicationStore;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.AMLivelinessMonitor;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
+@@ -140,7 +138,7 @@ public void setUp() throws Exception {
+     AMLivelinessMonitor amLivelinessMonitor = mock(AMLivelinessMonitor.class);
+     AMLivelinessMonitor amFinishingMonitor = mock(AMLivelinessMonitor.class);
+     this.rmContext =
+-        new RMContextImpl(new MemStore(), rmDispatcher,
++        new RMContextImpl(rmDispatcher,
+           containerAllocationExpirer, amLivelinessMonitor, amFinishingMonitor,
+           null, new ApplicationTokenSecretManager(conf),
+           new RMContainerTokenSecretManager(conf),
+@@ -171,7 +169,6 @@ protected RMApp createNewTestApp(ApplicationSubmissionContext submissionContext)
+     // ensure max retries set to known value
+     conf.setInt(YarnConfiguration.RM_AM_MAX_RETRIES, maxRetries);
+     String clientTokenStr = "bogusstring";
+-    ApplicationStore appStore = mock(ApplicationStore.class);
+     YarnScheduler scheduler = mock(YarnScheduler.class);
+     ApplicationMasterService masterService =
+         new ApplicationMasterService(rmContext, scheduler);
+@@ -183,7 +180,7 @@ protected RMApp createNewTestApp(ApplicationSubmissionContext submissionContext)
+     RMApp application = new RMAppImpl(applicationId, rmContext,
+         conf, name, user,
+         queue, submissionContext, clientTokenStr,
+-        appStore, scheduler,
++        scheduler,
+         masterService, System.currentTimeMillis());
+ 
+     testAppStartState(applicationId, user, name, queue, application);
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/TestRMAppAttemptTransitions.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/TestRMAppAttemptTransitions.java
+index 572cb2c..83593fb 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/TestRMAppAttemptTransitions.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/attempt/TestRMAppAttemptTransitions.java
+@@ -53,7 +53,6 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEvent;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEventType;
+ import org.apache.hadoop.yarn.server.resourcemanager.amlauncher.ApplicationMasterLauncher;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.resourcetracker.InlineDispatcher;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
+@@ -162,7 +161,7 @@ public void setUp() throws Exception {
+     amFinishingMonitor = mock(AMLivelinessMonitor.class);
+     Configuration conf = new Configuration();
+     rmContext =
+-        new RMContextImpl(new MemStore(), rmDispatcher,
++        new RMContextImpl(rmDispatcher,
+           containerAllocationExpirer, amLivelinessMonitor, amFinishingMonitor,
+           null, new ApplicationTokenSecretManager(conf),
+           new RMContainerTokenSecretManager(conf),
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestApplicationLimits.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestApplicationLimits.java
+index 123b88f..ae628ef 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestApplicationLimits.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestApplicationLimits.java
+@@ -479,7 +479,7 @@ public void testHeadroom() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0); 
+     FiCaSchedulerApp app_0_0 = 
+         spy(new FiCaSchedulerApp(appAttemptId_0_0, user_0, queue, 
+-            queue.getActiveUsersManager(), rmContext, null));
++            queue.getActiveUsersManager(), rmContext));
+     queue.submitApplication(app_0_0, user_0, A);
+ 
+     List<ResourceRequest> app_0_0_requests = new ArrayList<ResourceRequest>();
+@@ -498,7 +498,7 @@ public void testHeadroom() throws Exception {
+         TestUtils.getMockApplicationAttemptId(1, 0); 
+     FiCaSchedulerApp app_0_1 = 
+         spy(new FiCaSchedulerApp(appAttemptId_0_1, user_0, queue, 
+-            queue.getActiveUsersManager(), rmContext, null));
++            queue.getActiveUsersManager(), rmContext));
+     queue.submitApplication(app_0_1, user_0, A);
+     
+     List<ResourceRequest> app_0_1_requests = new ArrayList<ResourceRequest>();
+@@ -517,7 +517,7 @@ public void testHeadroom() throws Exception {
+         TestUtils.getMockApplicationAttemptId(2, 0); 
+     FiCaSchedulerApp app_1_0 = 
+         spy(new FiCaSchedulerApp(appAttemptId_1_0, user_1, queue, 
+-            queue.getActiveUsersManager(), rmContext, null));
++            queue.getActiveUsersManager(), rmContext));
+     queue.submitApplication(app_1_0, user_1, A);
+ 
+     List<ResourceRequest> app_1_0_requests = new ArrayList<ResourceRequest>();
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
+index 44c4e8c..d517d62 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
+@@ -38,7 +38,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.Task;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+@@ -74,8 +74,8 @@
+   
+   @Before
+   public void setUp() throws Exception {
+-    Store store = StoreFactory.getStore(new Configuration());
+-    resourceManager = new ResourceManager(store);
++    RMStateStore store = StoreFactory.getStore(new Configuration());
++    resourceManager = new ResourceManager(false, store);
+     CapacitySchedulerConfiguration csConf 
+        = new CapacitySchedulerConfiguration();
+     setupQueueConfiguration(csConf);
+@@ -249,7 +249,7 @@ public void testRefreshQueues() throws Exception {
+     CapacitySchedulerConfiguration conf = new CapacitySchedulerConfiguration();
+     setupQueueConfiguration(conf);
+     cs.setConf(new YarnConfiguration());
+-    cs.reinitialize(conf, new RMContextImpl(null, null, null, null, null, null,
++    cs.reinitialize(conf, new RMContextImpl(null, null, null, null, null,
+       null, new RMContainerTokenSecretManager(conf),
+       new ClientToAMTokenSecretManagerInRM()));
+     checkQueueCapacities(cs, A_CAPACITY, B_CAPACITY);
+@@ -347,7 +347,7 @@ public void testParseQueue() throws IOException {
+     conf.setCapacity(CapacitySchedulerConfiguration.ROOT + ".a.a1.b1", 100.0f);
+     conf.setUserLimitFactor(CapacitySchedulerConfiguration.ROOT + ".a.a1.b1", 100.0f);
+ 
+-    cs.reinitialize(conf, new RMContextImpl(null, null, null, null, null, null,
++    cs.reinitialize(conf, new RMContextImpl(null, null, null, null, null,
+       null, new RMContainerTokenSecretManager(conf),
+       new ClientToAMTokenSecretManagerInRM()));
+   }
+@@ -359,7 +359,7 @@ public void testReconnectedNode() throws Exception {
+     setupQueueConfiguration(csConf);
+     CapacityScheduler cs = new CapacityScheduler();
+     cs.setConf(new YarnConfiguration());
+-    cs.reinitialize(csConf, new RMContextImpl(null, null, null, null, null,
++    cs.reinitialize(csConf, new RMContextImpl(null, null, null, null,
+       null, null, new RMContainerTokenSecretManager(csConf),
+       new ClientToAMTokenSecretManagerInRM()));
+ 
+@@ -385,7 +385,7 @@ public void testRefreshQueuesWithNewQueue() throws Exception {
+     CapacitySchedulerConfiguration conf = new CapacitySchedulerConfiguration();
+     setupQueueConfiguration(conf);
+     cs.setConf(new YarnConfiguration());
+-    cs.reinitialize(conf, new RMContextImpl(null, null, null, null, null, null,
++    cs.reinitialize(conf, new RMContextImpl(null, null, null, null, null,
+       null, new RMContainerTokenSecretManager(conf),
+       new ClientToAMTokenSecretManagerInRM()));
+     checkQueueCapacities(cs, A_CAPACITY, B_CAPACITY);
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+index f9d6c60..34ad106 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+@@ -250,14 +250,14 @@ public void testSingleQueueOneUserMetrics() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0); 
+     FiCaSchedulerApp app_0 = 
+         new FiCaSchedulerApp(appAttemptId_0, user_0, a, 
+-            mock(ActiveUsersManager.class), rmContext, null);
++            mock(ActiveUsersManager.class), rmContext);
+     a.submitApplication(app_0, user_0, B);
+ 
+     final ApplicationAttemptId appAttemptId_1 = 
+         TestUtils.getMockApplicationAttemptId(1, 0); 
+     FiCaSchedulerApp app_1 = 
+         new FiCaSchedulerApp(appAttemptId_1, user_0, a, 
+-            mock(ActiveUsersManager.class), rmContext, null);
++            mock(ActiveUsersManager.class), rmContext);
+     a.submitApplication(app_1, user_0, B);  // same user
+ 
+     
+@@ -295,14 +295,14 @@ public void testUserQueueAcl() throws Exception {
+     final ApplicationAttemptId appAttemptId_0 = TestUtils
+         .getMockApplicationAttemptId(0, 1);
+     FiCaSchedulerApp app_0 = new FiCaSchedulerApp(appAttemptId_0, user_d, d, null,
+-        rmContext, null);
++        rmContext);
+     d.submitApplication(app_0, user_d, D);
+ 
+     // Attempt the same application again
+     final ApplicationAttemptId appAttemptId_1 = TestUtils
+         .getMockApplicationAttemptId(0, 2);
+     FiCaSchedulerApp app_1 = new FiCaSchedulerApp(appAttemptId_1, user_d, d, null,
+-        rmContext, null);
++        rmContext);
+     d.submitApplication(app_1, user_d, D); // same user
+   }
+ 
+@@ -320,7 +320,7 @@ public void testAppAttemptMetrics() throws Exception {
+     final ApplicationAttemptId appAttemptId_0 = TestUtils
+         .getMockApplicationAttemptId(0, 1);
+     FiCaSchedulerApp app_0 = new FiCaSchedulerApp(appAttemptId_0, user_0, a, null,
+-        rmContext, null);
++        rmContext);
+     a.submitApplication(app_0, user_0, B);
+     
+     when(cs.getApplication(appAttemptId_0)).thenReturn(app_0);
+@@ -335,7 +335,7 @@ public void testAppAttemptMetrics() throws Exception {
+     final ApplicationAttemptId appAttemptId_1 = TestUtils
+         .getMockApplicationAttemptId(0, 2);
+     FiCaSchedulerApp app_1 = new FiCaSchedulerApp(appAttemptId_1, user_0, a, null,
+-        rmContext, null);
++        rmContext);
+     a.submitApplication(app_1, user_0, B); // same user
+ 
+     assertEquals(1, a.getMetrics().getAppsSubmitted());
+@@ -371,14 +371,14 @@ public void testSingleQueueWithOneUser() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0); 
+     FiCaSchedulerApp app_0 = 
+         new FiCaSchedulerApp(appAttemptId_0, user_0, a, 
+-            mock(ActiveUsersManager.class), rmContext, null);
++            mock(ActiveUsersManager.class), rmContext);
+     a.submitApplication(app_0, user_0, A);
+ 
+     final ApplicationAttemptId appAttemptId_1 = 
+         TestUtils.getMockApplicationAttemptId(1, 0); 
+     FiCaSchedulerApp app_1 = 
+         new FiCaSchedulerApp(appAttemptId_1, user_0, a, 
+-            mock(ActiveUsersManager.class), rmContext, null);
++            mock(ActiveUsersManager.class), rmContext);
+     a.submitApplication(app_1, user_0, A);  // same user
+ 
+     
+@@ -495,21 +495,21 @@ public void testUserLimits() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0); 
+     FiCaSchedulerApp app_0 = 
+         new FiCaSchedulerApp(appAttemptId_0, user_0, a, 
+-            a.getActiveUsersManager(), rmContext, null);
++            a.getActiveUsersManager(), rmContext);
+     a.submitApplication(app_0, user_0, A);
+ 
+     final ApplicationAttemptId appAttemptId_1 = 
+         TestUtils.getMockApplicationAttemptId(1, 0); 
+     FiCaSchedulerApp app_1 = 
+         new FiCaSchedulerApp(appAttemptId_1, user_0, a, 
+-            a.getActiveUsersManager(), rmContext, null);
++            a.getActiveUsersManager(), rmContext);
+     a.submitApplication(app_1, user_0, A);  // same user
+ 
+     final ApplicationAttemptId appAttemptId_2 = 
+         TestUtils.getMockApplicationAttemptId(2, 0); 
+     FiCaSchedulerApp app_2 = 
+         new FiCaSchedulerApp(appAttemptId_2, user_1, a, 
+-            a.getActiveUsersManager(), rmContext, null);
++            a.getActiveUsersManager(), rmContext);
+     a.submitApplication(app_2, user_1, A);
+ 
+     // Setup some nodes
+@@ -588,21 +588,21 @@ public void testHeadroomWithMaxCap() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0); 
+     FiCaSchedulerApp app_0 = 
+         new FiCaSchedulerApp(appAttemptId_0, user_0, a, 
+-            a.getActiveUsersManager(), rmContext, null);
++            a.getActiveUsersManager(), rmContext);
+     a.submitApplication(app_0, user_0, A);
+ 
+     final ApplicationAttemptId appAttemptId_1 = 
+         TestUtils.getMockApplicationAttemptId(1, 0); 
+     FiCaSchedulerApp app_1 = 
+         new FiCaSchedulerApp(appAttemptId_1, user_0, a, 
+-            a.getActiveUsersManager(), rmContext, null);
++            a.getActiveUsersManager(), rmContext);
+     a.submitApplication(app_1, user_0, A);  // same user
+ 
+     final ApplicationAttemptId appAttemptId_2 = 
+         TestUtils.getMockApplicationAttemptId(2, 0); 
+     FiCaSchedulerApp app_2 = 
+         new FiCaSchedulerApp(appAttemptId_2, user_1, a, 
+-            a.getActiveUsersManager(), rmContext, null);
++            a.getActiveUsersManager(), rmContext);
+     a.submitApplication(app_2, user_1, A);
+ 
+     // Setup some nodes
+@@ -699,28 +699,28 @@ public void testSingleQueueWithMultipleUsers() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0); 
+     FiCaSchedulerApp app_0 = 
+         new FiCaSchedulerApp(appAttemptId_0, user_0, a, 
+-            a.getActiveUsersManager(), rmContext, null);
++            a.getActiveUsersManager(), rmContext);
+     a.submitApplication(app_0, user_0, A);
+ 
+     final ApplicationAttemptId appAttemptId_1 = 
+         TestUtils.getMockApplicationAttemptId(1, 0); 
+     FiCaSchedulerApp app_1 = 
+         new FiCaSchedulerApp(appAttemptId_1, user_0, a, 
+-            a.getActiveUsersManager(), rmContext, null);
++            a.getActiveUsersManager(), rmContext);
+     a.submitApplication(app_1, user_0, A);  // same user
+ 
+     final ApplicationAttemptId appAttemptId_2 = 
+         TestUtils.getMockApplicationAttemptId(2, 0); 
+     FiCaSchedulerApp app_2 = 
+         new FiCaSchedulerApp(appAttemptId_2, user_1, a, 
+-            a.getActiveUsersManager(), rmContext, null);
++            a.getActiveUsersManager(), rmContext);
+     a.submitApplication(app_2, user_1, A);
+ 
+     final ApplicationAttemptId appAttemptId_3 = 
+         TestUtils.getMockApplicationAttemptId(3, 0); 
+     FiCaSchedulerApp app_3 = 
+         new FiCaSchedulerApp(appAttemptId_3, user_2, a, 
+-            a.getActiveUsersManager(), rmContext, null);
++            a.getActiveUsersManager(), rmContext);
+     a.submitApplication(app_3, user_2, A);
+     
+     // Setup some nodes
+@@ -874,14 +874,14 @@ public void testReservation() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0); 
+     FiCaSchedulerApp app_0 = 
+         new FiCaSchedulerApp(appAttemptId_0, user_0, a, 
+-            mock(ActiveUsersManager.class), rmContext, null);
++            mock(ActiveUsersManager.class), rmContext);
+     a.submitApplication(app_0, user_0, A);
+ 
+     final ApplicationAttemptId appAttemptId_1 = 
+         TestUtils.getMockApplicationAttemptId(1, 0); 
+     FiCaSchedulerApp app_1 = 
+         new FiCaSchedulerApp(appAttemptId_1, user_1, a, 
+-            mock(ActiveUsersManager.class), rmContext, null);
++            mock(ActiveUsersManager.class), rmContext);
+     a.submitApplication(app_1, user_1, A);  
+ 
+     // Setup some nodes
+@@ -973,14 +973,14 @@ public void testStolenReservedContainer() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0);
+     FiCaSchedulerApp app_0 =
+         new FiCaSchedulerApp(appAttemptId_0, user_0, a,
+-            mock(ActiveUsersManager.class), rmContext, null);
++            mock(ActiveUsersManager.class), rmContext);
+     a.submitApplication(app_0, user_0, A);
+ 
+     final ApplicationAttemptId appAttemptId_1 =
+         TestUtils.getMockApplicationAttemptId(1, 0);
+     FiCaSchedulerApp app_1 =
+         new FiCaSchedulerApp(appAttemptId_1, user_1, a,
+-            mock(ActiveUsersManager.class), rmContext, null);
++            mock(ActiveUsersManager.class), rmContext);
+     a.submitApplication(app_1, user_1, A);
+ 
+     // Setup some nodes
+@@ -1072,14 +1072,14 @@ public void testReservationExchange() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0); 
+     FiCaSchedulerApp app_0 = 
+         new FiCaSchedulerApp(appAttemptId_0, user_0, a, 
+-            mock(ActiveUsersManager.class), rmContext, null);
++            mock(ActiveUsersManager.class), rmContext);
+     a.submitApplication(app_0, user_0, A);
+ 
+     final ApplicationAttemptId appAttemptId_1 = 
+         TestUtils.getMockApplicationAttemptId(1, 0); 
+     FiCaSchedulerApp app_1 = 
+         new FiCaSchedulerApp(appAttemptId_1, user_1, a, 
+-            mock(ActiveUsersManager.class), rmContext, null);
++            mock(ActiveUsersManager.class), rmContext);
+     a.submitApplication(app_1, user_1, A);  
+ 
+     // Setup some nodes
+@@ -1187,7 +1187,7 @@ public void testLocalityScheduling() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0); 
+     FiCaSchedulerApp app_0 = 
+         spy(new FiCaSchedulerApp(appAttemptId_0, user_0, a, 
+-            mock(ActiveUsersManager.class), rmContext, null));
++            mock(ActiveUsersManager.class), rmContext));
+     a.submitApplication(app_0, user_0, A);
+     
+     // Setup some nodes and racks
+@@ -1327,7 +1327,7 @@ public void testApplicationPriorityScheduling() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0); 
+     FiCaSchedulerApp app_0 = 
+         spy(new FiCaSchedulerApp(appAttemptId_0, user_0, a, 
+-            mock(ActiveUsersManager.class), rmContext, null));
++            mock(ActiveUsersManager.class), rmContext));
+     a.submitApplication(app_0, user_0, A);
+     
+     // Setup some nodes and racks
+@@ -1457,7 +1457,7 @@ public void testSchedulingConstraints() throws Exception {
+         TestUtils.getMockApplicationAttemptId(0, 0); 
+     FiCaSchedulerApp app_0 = 
+         spy(new FiCaSchedulerApp(appAttemptId_0, user_0, a, 
+-            mock(ActiveUsersManager.class), rmContext, null));
++            mock(ActiveUsersManager.class), rmContext));
+     a.submitApplication(app_0, user_0, A);
+     
+     // Setup some nodes and racks
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestQueueParsing.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestQueueParsing.java
+index e529815..c31fa7b 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestQueueParsing.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestQueueParsing.java
+@@ -43,7 +43,7 @@ public void testQueueParsing() throws Exception {
+ 
+     CapacityScheduler capacityScheduler = new CapacityScheduler();
+     capacityScheduler.setConf(conf);
+-    capacityScheduler.reinitialize(conf, new RMContextImpl(null, null, null,
++    capacityScheduler.reinitialize(conf, new RMContextImpl(null, null,
+       null, null, null, null, new RMContainerTokenSecretManager(conf),
+       new ClientToAMTokenSecretManagerInRM()));
+     
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestUtils.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestUtils.java
+index 3e20f97..df53d85 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestUtils.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestUtils.java
+@@ -83,7 +83,7 @@ public EventHandler getEventHandler() {
+     
+     Configuration conf = new Configuration();
+     RMContext rmContext =
+-        new RMContextImpl(null, nullDispatcher, cae, null, null, null,
++        new RMContextImpl(nullDispatcher, cae, null, null, null,
+           new ApplicationTokenSecretManager(conf),
+           new RMContainerTokenSecretManager(conf),
+           new ClientToAMTokenSecretManagerInRM());
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSSchedulerApp.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSSchedulerApp.java
+index f6ed364..62a1b9b 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSSchedulerApp.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFSSchedulerApp.java
+@@ -53,7 +53,7 @@ public void testDelayScheduling() {
+ 
+     ApplicationAttemptId applicationAttemptId = createAppAttemptId(1, 1);
+     FSSchedulerApp schedulerApp =
+-        new FSSchedulerApp(applicationAttemptId, "user1", queue , null, null, null);
++        new FSSchedulerApp(applicationAttemptId, "user1", queue , null, null);
+ 
+     // Default level should be node-local
+     assertEquals(NodeType.NODE_LOCAL, schedulerApp.getAllowedLocalityLevel(
+@@ -111,7 +111,7 @@ public void testLocalityLevelWithoutDelays() {
+ 
+     ApplicationAttemptId applicationAttemptId = createAppAttemptId(1, 1);
+     FSSchedulerApp schedulerApp =
+-        new FSSchedulerApp(applicationAttemptId, "user1", queue , null, null, null);
++        new FSSchedulerApp(applicationAttemptId, "user1", queue , null, null);
+     assertEquals(NodeType.OFF_SWITCH, schedulerApp.getAllowedLocalityLevel(
+         prio, 10, -1.0, -1.0));
+   }
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+index 4a26920..38b3698 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+@@ -47,7 +47,7 @@
+ import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
+ import org.apache.hadoop.yarn.server.resourcemanager.MockNodes;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptState;
+@@ -97,8 +97,8 @@ public void setUp() throws IOException {
+     Configuration conf = createConfiguration();
+     // All tests assume only one assignment per node update
+     conf.set(FairSchedulerConfiguration.ASSIGN_MULTIPLE, "false");
+-    Store store = StoreFactory.getStore(conf);
+-    resourceManager = new ResourceManager(store);
++    RMStateStore store = StoreFactory.getStore(conf);
++    resourceManager = new ResourceManager(false, store);
+     resourceManager.init(conf);
+     ((AsyncDispatcher)resourceManager.getRMContext().getDispatcher()).start();
+     scheduler.reinitialize(conf, resourceManager.getRMContext());
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java
+index 90a9de1..bc60034 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/TestFifoScheduler.java
+@@ -38,7 +38,7 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.Task;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
+ import org.apache.hadoop.yarn.server.resourcemanager.resourcetracker.InlineDispatcher;
+@@ -59,8 +59,8 @@
+   
+   @Before
+   public void setUp() throws Exception {
+-    Store store = StoreFactory.getStore(new Configuration());
+-    resourceManager = new ResourceManager(store);
++    RMStateStore store = StoreFactory.getStore(new Configuration());
++    resourceManager = new ResourceManager(false, store);
+     Configuration conf = new Configuration();
+     conf.setClass(YarnConfiguration.RM_SCHEDULER, 
+         FifoScheduler.class, ResourceScheduler.class);
+@@ -91,7 +91,7 @@ public void testFifoSchedulerCapacityWhenNoNMs() {
+   @Test
+   public void testAppAttemptMetrics() throws Exception {
+     AsyncDispatcher dispatcher = new InlineDispatcher();
+-    RMContext rmContext = new RMContextImpl(null, dispatcher, null,
++    RMContext rmContext = new RMContextImpl(dispatcher, null,
+         null, null, null, null, null, null);
+ 
+     FifoScheduler schedular = new FifoScheduler();
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/TestRMWebApp.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/TestRMWebApp.java
+index 67b2903..b6e5ba3 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/TestRMWebApp.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/TestRMWebApp.java
+@@ -38,7 +38,6 @@
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContextImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.applicationsmanager.MockAsm;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.MemStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppState;
+ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
+@@ -160,7 +159,7 @@ public static RMContext mockRMContext(int numApps, int racks, int numNodes,
+     for (RMNode node : deactivatedNodes) {
+       deactivatedNodesMap.put(node.getHostName(), node);
+     }
+-   return new RMContextImpl(new MemStore(), null, null, null, null,
++   return new RMContextImpl(null, null, null, null,
+        null, null, null, null) {
+       @Override
+       public ConcurrentMap<ApplicationId, RMApp> getRMApps() {
+@@ -201,7 +200,7 @@ public static CapacityScheduler mockCapacityScheduler() throws IOException {
+ 
+     CapacityScheduler cs = new CapacityScheduler();
+     cs.setConf(new YarnConfiguration());
+-    cs.reinitialize(conf, new RMContextImpl(null, null, null, null, null, null,
++    cs.reinitialize(conf, new RMContextImpl(null, null, null, null, null,
+       null, new RMContainerTokenSecretManager(conf),
+       new ClientToAMTokenSecretManagerInRM()));
+     return cs;
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/MiniYARNCluster.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/MiniYARNCluster.java
+index 9a7a978..93a5474 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/MiniYARNCluster.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/MiniYARNCluster.java
+@@ -48,7 +48,7 @@
+ import org.apache.hadoop.yarn.server.nodemanager.NodeStatusUpdaterImpl;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+ import org.apache.hadoop.yarn.server.resourcemanager.ResourceTrackerService;
+-import org.apache.hadoop.yarn.server.resourcemanager.recovery.Store;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
+ import org.apache.hadoop.yarn.server.resourcemanager.recovery.StoreFactory;
+ import org.apache.hadoop.yarn.service.AbstractService;
+ import org.apache.hadoop.yarn.service.CompositeService;
+@@ -154,8 +154,8 @@ public synchronized void start() {
+           getConfig().set(YarnConfiguration.RM_WEBAPP_ADDRESS,
+               MiniYARNCluster.getHostname() + ":0");
+         }
+-        Store store = StoreFactory.getStore(getConfig());
+-        resourceManager = new ResourceManager(store) {
++        RMStateStore store = StoreFactory.getStore(getConfig());
++        resourceManager = new ResourceManager(false, store) {
+           @Override
+           protected void doSecureLogin() throws IOException {
+             // Don't try to login using keytab in the testcase.
+diff --git hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestRMNMSecretKeys.java hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestRMNMSecretKeys.java
+index 9b6024c..5e78b38 100644
+--- hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestRMNMSecretKeys.java
++++ hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/TestRMNMSecretKeys.java
+@@ -47,7 +47,7 @@ public void testNMUpdation() throws Exception {
+     // intervene
+ 
+     final DrainDispatcher dispatcher = new DrainDispatcher();
+-    ResourceManager rm = new ResourceManager(null) {
++    ResourceManager rm = new ResourceManager(false, null) {
+       @Override
+       protected void doSecureLogin() throws IOException {
+         // Do nothing.
