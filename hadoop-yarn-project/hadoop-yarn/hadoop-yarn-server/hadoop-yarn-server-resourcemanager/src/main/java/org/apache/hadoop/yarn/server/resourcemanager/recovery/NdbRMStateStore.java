@@ -61,7 +61,7 @@ public class NdbRMStateStore implements RMStateStore {
     public NdbRMStateStore() {
         // Load the properties from the clusterj.properties file
 
-        File propsFile = new File("/home/aknahs/Desktop/clusterj_example_wp_7_1_2a/clusterj.properties");
+        File propsFile = new File("src/test/java/org/apache/hadoop/yarn/server/resourcemanager/clusterj.properties");
         InputStream inStream;
         try {
             inStream = new FileInputStream(propsFile);
