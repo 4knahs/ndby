@@ -22,6 +22,7 @@ import com.mysql.clusterj.Session;
 import com.mysql.clusterj.SessionFactory;
 import com.mysql.clusterj.annotation.PersistenceCapable;
 import com.mysql.clusterj.annotation.PrimaryKey;
+import com.mysql.clusterj.annotation.Lob;
 import com.mysql.clusterj.query.QueryBuilder;
 import com.mysql.clusterj.query.QueryDomainType;
 import java.io.File;
@@ -247,7 +248,8 @@ public class NdbRMStateStore implements RMStateStore {
 
         long getSubmitTime();
         void setSubmitTime(long time);
-
+	
+	@Lob
         byte[] getAppContext();
         void setAppContext(byte[] context);
     }
@@ -262,7 +264,8 @@ public class NdbRMStateStore implements RMStateStore {
         @PrimaryKey
         int getApplicationId();
         void setApplicationId(int id);
-
+        
+        @Lob  
         byte[] getMasterContainer();
         void setMasterContainer(byte[] state);
     }

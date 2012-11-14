@@ -78,6 +78,19 @@
                     </execution>
                 </executions>
             </plugin>
+            <plugin>
+              <groupId>org.apache.maven.plugins</groupId>
+              <artifactId>maven-surefire-plugin</artifactId>
+              <configuration>
+                <properties>
+                  <property>
+                    <name>listener</name>
+                    <value>org.apache.hadoop.test.TimedOutTestsListener</value>
+                 </property>
+                </properties>
+                <argLine>-Djava.library.path=/usr/local/mysql/lib</argLine>
+               </configuration>
+            </plugin>
         </plugins>
     </build>
 
