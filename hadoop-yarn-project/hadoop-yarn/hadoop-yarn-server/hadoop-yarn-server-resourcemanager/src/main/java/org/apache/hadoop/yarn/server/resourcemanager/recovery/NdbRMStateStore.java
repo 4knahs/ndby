@@ -131,9 +131,9 @@ public class NdbRMStateStore implements RMStateStore {
 
                     //Populate AppAttempState in each appState
                     //TODO : make sure name is case sensitive
-                    domainAttempt.where(domainAttempt.get("ApplicationId").equal(domainAttempt.param("ApplicationId")));
+                    domainAttempt.where(domainAttempt.get("applicationId").equal(domainAttempt.param("applicationId")));
                     queryAttempt = session.createQuery(domainAttempt);
-                    queryAttempt.setParameter("ApplicationId",storedApp.getId());
+                    queryAttempt.setParameter("applicationId",storedApp.getId());
                     resultsAttempt = queryAttempt.getResultList();
                     
                     for (NdbAttemptStateCJ storedAttempt : resultsAttempt) {
