@@ -48,6 +48,8 @@ import org.apache.hadoop.yarn.event.Dispatcher;
 import org.apache.hadoop.yarn.proto.YarnProtos;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
+import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
+import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEventType;
 
 /**
  *
@@ -97,6 +99,17 @@ public class NdbRMStateStore implements RMStateStore {
         //new HashMap<ApplicationId, ApplicationState>();
 
         public NdbRMState() {
+            populate();
+        }
+
+        @Override
+        public Map<ApplicationId, ApplicationState> getApplicationState() {
+            populate();
+            return appState; 
+        }
+        
+        private void populate()
+        {
             appState = new HashMap<ApplicationId, ApplicationState>();
             QueryDomainType<NdbApplicationStateCJ> domainApp;
             QueryDomainType<NdbAttemptStateCJ> domainAttempt;
@@ -154,11 +167,6 @@ public class NdbRMStateStore implements RMStateStore {
                 }
             }
         }
-
-        @Override
-        public Map<ApplicationId, ApplicationState> getApplicationState() {
-            return appState; 
-        }
     }
 
     @Override
@@ -189,8 +197,18 @@ public class NdbRMStateStore implements RMStateStore {
 
         //Write NdbAttemptState to ndb database
         session.persist(storedAttempt);
+        
+            //TODO move this to base class method and remove java imports
+        dispatcher.getEventHandler().handle(
+        new RMAppAttemptEvent(appAttempt.getAppAttemptId(), 
+                              RMAppAttemptEventType.ATTEMPT_SAVED));
     }
 
+    public void clearData()
+    {
+        session.deletePersistentAll(NdbApplicationStateCJ.class);
+        session.deletePersistentAll(NdbAttemptStateCJ.class);
+    }
     public class NdbApplicationAttemptState implements ApplicationAttemptState {
 
         Container masterContainer;
